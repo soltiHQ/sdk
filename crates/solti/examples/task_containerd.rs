@@ -34,15 +34,14 @@ use solti::{
     core::{SupervisorApi, TaskWatchSubscription},
     exec::{
         container::{
-            ContainerProcessPolicy, ContainerRunnerConfig,
+            ContainerProcessPolicy, ContainerRunnerConfig, ContainerSpec,
             containerd::{ContainerNetwork, ContainerdConfig, ContainerdEngine},
             register_container_runner_with_config,
         },
         isolation::SeccompPolicy,
     },
     model::{
-        ContainerSpec, RestartPolicy, Task, TaskEnv, TaskId, TaskManifest, TaskRunQuery, TaskSpec,
-        TaskWorkload,
+        RestartPolicy, Task, TaskEnv, TaskId, TaskManifest, TaskRunQuery, TaskSpec, TaskWorkload,
     },
     runner::RunnerRouter,
 };
@@ -130,7 +129,7 @@ solti: supervised containerd workload
 
     let mut env = TaskEnv::new();
     env.push("SOLTI_EXAMPLE", "umbrella-container");
-    let workload = TaskWorkload::Container(ContainerSpec::new(
+    let workload = TaskWorkload::from_body(&ContainerSpec::new(
         image,
         Some(vec!["/bin/sh".into()]),
         vec![
@@ -138,7 +137,7 @@ solti: supervised containerd workload
             "test \"$SOLTI_EXAMPLE\" = umbrella-container".into(),
         ],
         env,
-    ));
+    ))?;
     let spec = TaskSpec::builder("containers", workload, 120_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;

@@ -63,7 +63,7 @@ impl HttpAdapter {
     }
 
     /// Sends one discovery request.
-    pub(super) async fn sync(&self, request: SyncRequest) -> Result<(), DiscoverError> {
+    pub(super) async fn sync(&self, request: SyncRequest) -> Result<SyncResponse, DiscoverError> {
         let mut request = self.client.post(self.url.clone()).json(&request);
         if let Some(value) = &self.authorization {
             request = request.header(AUTHORIZATION, value.clone());
@@ -93,6 +93,16 @@ impl HttpAdapter {
         })?;
 
         validate_response(response)
+    }
+
+    /// Returns the size of the JSON body `sync` sends for `request`.
+    ///
+    /// `reqwest` sends `serde_json::to_vec(&request)` as the body, so this is
+    /// the length of that same encoding. Bytes fields are base64 in it. A
+    /// request that cannot be encoded, which the SDK never builds, measures
+    /// `usize::MAX` and fits no budget.
+    pub(super) fn encoded_len(&self, request: &SyncRequest) -> usize {
+        serde_json::to_vec(request).map_or(usize::MAX, |body| body.len())
     }
 
     /// Returns whether the endpoint uses HTTPS.
@@ -259,6 +269,10 @@ fn truncate_body(body: &str) -> String {
     }
     format!("{}... [truncated]", &body[..end])
 }
+
+/// The HTTP front of the test control plane.
+#[cfg(test)]
+pub(super) mod fake {}
 
 #[cfg(test)]
 mod tests {

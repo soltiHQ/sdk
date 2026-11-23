@@ -49,13 +49,14 @@ use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 use tokio::process::Command;
 use tracing::{Instrument as _, debug, debug_span, trace, warn};
 
-use solti_model::{SubprocessSpec, Task, TaskWorkload, WORKLOAD_API_VERSION, WorkloadTypeMeta};
+use solti_model::{Task, WorkloadDecl, workload_schema_for};
 use solti_runner::{
     BuildContext, OutputPublisherHandle, OutputSink, RunId, Runner, RunnerError, RunnerErrorKind,
     RunnerType, merge_env, record_runner_error, request_output_sink,
 };
 
 use crate::subprocess::{
+    SUBPROCESS_KIND, SubprocessMode, SubprocessSpec,
     backend::{PreparedSubprocessBackendConfig, SubprocessBackendConfig},
     boundary::PinnedCwd,
     child::{ChildOutput, ProcessChild},
@@ -68,16 +69,17 @@ use crate::subprocess::{
     task::SubprocessTaskConfig,
 };
 use crate::{
+    EXEC_API_VERSION,
     output::{LogConfig, OutputDrain, OutputTasks, StreamKind, log_stream},
-    registration::validate_runner_name,
+    registration::{decode_workload, validate_runner_name},
 };
 
 #[cfg(unix)]
 use crate::subprocess::exec_unix::ExecvePlan;
 
-/// Runner that executes [`TaskWorkload::Subprocess`] as OS subprocesses.
+/// Runner that executes `exec.solti.io/v1` `Subprocess` workloads as OS subprocesses.
 ///
-/// The runner declares the built-in `solti.io/v1`, kind `Subprocess` workload.
+/// The runner declares that type, with [`SubprocessSpec`] as its body.
 /// Its name becomes part of run IDs and the automatic runner label.
 ///
 /// ## Attempt Results
@@ -247,38 +249,27 @@ impl SubprocessRunner {
         cancellation: &solti_runner::BuildCancellation,
     ) -> Result<BuiltSubprocessTask, RunnerError> {
         let spec = task.spec();
-        let (cfg, script_body) = match spec.workload() {
-            TaskWorkload::Subprocess(SubprocessSpec {
-                mode,
-                env,
-                cwd,
-                fail_on_non_zero,
-                ..
-            }) => {
-                let max_body = self.config.max_script_body_bytes();
-                let Resolved {
-                    command,
-                    args,
-                    script_body,
-                } = Self::resolve_mode(mode, max_body)?;
-                let cfg = SubprocessTaskConfig {
-                    seq: run_id.seq(),
-                    run_id: Arc::from(run_id.name()),
-                    fail_on_non_zero: *fail_on_non_zero,
-                    env: merge_env(env, ctx.env()),
-                    cwd: cwd.clone(),
-                    command,
-                    args,
-                };
-                (cfg, script_body)
-            }
-            other => {
-                return Err(RunnerError::UnsupportedWorkload {
-                    runner: self.name.clone(),
-                    api_version: other.api_version().to_owned(),
-                    kind: other.kind().to_owned(),
-                });
-            }
+        let SubprocessSpec {
+            mode,
+            env,
+            cwd,
+            fail_on_non_zero,
+            ..
+        } = decode_workload::<SubprocessSpec>(&self.name, spec.workload())?;
+        let max_body = self.config.max_script_body_bytes();
+        let Resolved {
+            command,
+            args,
+            script_body,
+        } = Self::resolve_mode(&mode, max_body)?;
+        let cfg = SubprocessTaskConfig {
+            seq: run_id.seq(),
+            run_id: Arc::from(run_id.name()),
+            fail_on_non_zero,
+            env: merge_env(&env, ctx.env()),
+            cwd,
+            command,
+            args,
         };
         cfg.validate().map_err(RunnerError::InvalidSpec)?;
         let pinned_cwd = self
@@ -302,16 +293,16 @@ impl SubprocessRunner {
     /// Script bodies are decoded and checked here.
     /// Script transport remains attempt-scoped.
     fn resolve_mode(
-        mode: &solti_model::SubprocessMode,
+        mode: &SubprocessMode,
         max_script_body_bytes: usize,
     ) -> Result<Resolved, RunnerError> {
         match mode {
-            solti_model::SubprocessMode::Command { command, args } => Ok(Resolved {
+            SubprocessMode::Command { command, args } => Ok(Resolved {
                 command: command.clone(),
                 args: args.clone(),
                 script_body: None,
             }),
-            solti_model::SubprocessMode::Script {
+            SubprocessMode::Script {
                 interpreter, args, ..
             } => {
                 let script = mode
@@ -324,9 +315,6 @@ impl SubprocessRunner {
                     script_body: Some(Arc::from(script)),
                 })
             }
-            _ => Err(RunnerError::InvalidSpec(
-                "unsupported subprocess mode variant".into(),
-            )),
         }
     }
 }
@@ -366,11 +354,28 @@ impl Runner for SubprocessRunner {
         &self.name
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-        vec![
-            WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess")
-                .expect("built-in workload GVK"),
-        ]
+    /// Declares `exec.solti.io/v1` `Subprocess`.
+    ///
+    /// The admission check decodes the body and refuses a script whose decoded size exceeds
+    /// this runner's `max_script_body_bytes`.
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        let max_body = self.config.max_script_body_bytes();
+        vec![WorkloadDecl::new(
+            EXEC_API_VERSION,
+            SUBPROCESS_KIND,
+            &workload_schema_for::<SubprocessSpec>(),
+            move |workload| {
+                let spec = workload
+                    .decode::<SubprocessSpec>()
+                    .map_err(|error| error.detail())?;
+                if matches!(spec.mode, SubprocessMode::Script { .. }) {
+                    spec.mode
+                        .decode_body_with_limit(max_body)
+                        .map_err(|error| format!("spec.mode.script.body: {error}"))?;
+                }
+                Ok(())
+            },
+        )]
     }
 
     /// Builds a reusable [`TaskRef`] from a subprocess resource.

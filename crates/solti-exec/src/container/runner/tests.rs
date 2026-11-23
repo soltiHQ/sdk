@@ -8,7 +8,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use solti_model::{ContainerSpec, TaskEnv, TaskSpec};
+use solti_model::{TaskEnv, TaskSpec, TaskWorkload};
+
 use taskvisor::{
     RuntimeError, Supervisor, SupervisorConfig, TaskOutcomeKind, TaskSpec as TaskvisorTaskSpec,
 };
@@ -21,7 +22,7 @@ use tracing::{
 };
 
 use super::*;
-use crate::container::{ContainerEngineInfo, ContainerOutput};
+use crate::container::{ContainerEngineInfo, ContainerOutput, ContainerSpec};
 
 #[derive(Default)]
 struct TraceCapture {
@@ -614,9 +615,12 @@ fn worker_context(engine: Arc<dyn ContainerEngine>) -> Arc<TaskExecContext> {
     let resource = task();
     let run_id = solti_runner::make_run_id("containerd", resource.slot().as_str());
     let build = BuildContext::default();
-    let TaskWorkload::Container(spec) = resource.spec().workload() else {
-        unreachable!("test task is a container workload");
+    let TaskWorkload::Routed(workload) = resource.spec().workload() else {
+        unreachable!("test task is a routed workload");
     };
+    let spec = workload
+        .decode::<ContainerSpec>()
+        .expect("test task is a container workload");
     Arc::new(TaskExecContext {
         engine,
         metrics: build.metrics().clone(),
@@ -637,12 +641,13 @@ fn worker_context(engine: Arc<dyn ContainerEngine>) -> Arc<TaskExecContext> {
 }
 
 fn task_with_image(image: impl Into<String>) -> Task {
-    let workload = TaskWorkload::Container(ContainerSpec::new(
+    let workload = TaskWorkload::from_body(&ContainerSpec::new(
         image.into(),
         Some(vec!["echo".into()]),
         vec!["hello".into()],
         TaskEnv::new(),
-    ));
+    ))
+    .unwrap();
     let spec = TaskSpec::builder("container-slot", workload, 5_000_u64)
         .build()
         .unwrap();
@@ -819,12 +824,13 @@ async fn tracing_does_not_record_container_process_inputs() {
     tracing::dispatcher::with_default(&dispatch, tracing::callsite::rebuild_interest_cache);
     capture.fields.lock().unwrap().clear();
 
-    let workload = TaskWorkload::Container(ContainerSpec::new(
+    let workload = TaskWorkload::from_body(&ContainerSpec::new(
         format!("https://user:{IMAGE_SECRET}@registry.invalid/private\n{FORGED}"),
         Some(vec![COMMAND_SECRET.to_owned()]),
         vec![ARG_SECRET.to_owned()],
         TaskEnv::single("ACCESS_TOKEN", ENV_SECRET),
-    ));
+    ))
+    .unwrap();
     let spec = TaskSpec::builder("container-slot", workload, 5_000_u64)
         .build()
         .unwrap();

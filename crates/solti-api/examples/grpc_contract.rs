@@ -29,9 +29,9 @@ use solti_api::{
     ApiError, ApiHandler, GRPC_API_SERVICE, GrpcApi, OutputEventStream, TaskWatchEventStream,
 };
 use solti_model::{
-    ExtensionWorkload, OutputChunk, OutputEvent, StreamKind, Task, TaskFilter, TaskId,
-    TaskManifest, TaskPage, TaskQuery, TaskRunPage, TaskRunQuery, TaskSpec, TaskWatchEvent,
-    TaskWorkload, Token, WritePreconditions,
+    OutputChunk, OutputEvent, StreamKind, Task, TaskFilter, TaskId, TaskManifest, TaskPage,
+    TaskQuery, TaskRunPage, TaskRunQuery, TaskSpec, TaskWatchEvent, TaskWorkload, Token, Workload,
+    WritePreconditions,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -190,7 +190,7 @@ impl ApiHandler for SnapshotHandler {
 }
 
 fn fixture_task() -> ExampleResult<Task> {
-    let workload = TaskWorkload::Extension(ExtensionWorkload::new(
+    let workload = TaskWorkload::Routed(Workload::new(
         "media.example.io/v1",
         "ImageResize",
         json!({

@@ -25,6 +25,9 @@ getrandom  = { workspace = true }
 schemars   = { workspace = true, optional = true }
 serde      = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
+serde_path_to_error = { workspace = true }
+sha2       = { workspace = true }
 subtle     = { workspace = true }
 thiserror  = { workspace = true }
 time       = { workspace = true, features = ["formatting", "parsing"] }

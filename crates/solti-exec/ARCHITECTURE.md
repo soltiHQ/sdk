@@ -126,7 +126,8 @@ flowchart LR
     Resources --> Result
 ```
 
-The build checks the exact built-in workload GVK.
+The runner declares its GVK with a schema derived from the spec type and a check that decodes the body; the subprocess check also enforces the runner's `max_script_body_bytes`.
+Core runs the check at admission, before anything is stored, and the build checks the exact GVK again.
 It merges task and runner environment values.
 It does not spawn a process or call a container engine.
 

@@ -3,9 +3,14 @@
 `solti-exec` provides concrete execution backends for the Solti SDK.
 
 - `host-process` feature provides reusable policy and low-level process controls.
-- `subprocess` feature implements a runner for `solti.io/v1`, kind `Subprocess`.
-- `container` feature implements an engine-neutral runner for `solti.io/v1`, kind `Container`.
+- `subprocess` feature implements a runner for `exec.solti.io/v1`, kind `Subprocess`.
+- `container` feature implements an engine-neutral runner for `exec.solti.io/v1`, kind `Container`.
 - `containerd` feature provides its native containerd 2.x engine.
+
+Each runner declares its type with a JSON Schema derived from `SubprocessSpec` or `ContainerSpec`, which live here.
+The registered capabilities carry the schemas' fingerprints, and the agent sends the schemas to Podium on request.
+Podium validates a spec against the schema before it deploys it; core checks the body again at admission.
+Unknown fields are refused in both specs.
 
 Use this crate when an agent executes host processes or OCI containers.
 The crate does not schedule tasks, store resources, or expose a network API.
@@ -17,10 +22,8 @@ The crate does not schedule tasks, store resources, or expose a network API.
 Register the default subprocess runner, then build a Taskvisor task through `RunnerRouter`:
 
 ```rust,no_run
-use solti_exec::subprocess::register_subprocess_runner;
-use solti_model::{
-    Flag, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskSpec, TaskWorkload,
-};
+use solti_exec::subprocess::{SubprocessMode, SubprocessSpec, register_subprocess_runner};
+use solti_model::{Flag, Task, TaskEnv, TaskSpec, TaskWorkload};
 use solti_runner::RunnerRouter;
 use std::time::Duration;
 
@@ -29,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut router = RunnerRouter::new();
     let runner = register_subprocess_runner(&mut router, "default")?;
 
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command {
             command: "echo".into(),
             args: vec!["hello".into()],
@@ -37,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("jobs", workload, 5_000_u64).build()?;
     let task = Task::new("hello", spec)?;
 
@@ -348,7 +351,7 @@ Building the `containerd` feature therefore requires a usable `protoc` through `
 `Command` executes the supplied program and arguments directly:
 
 ```rust
-use solti_model::SubprocessMode;
+use solti_exec::subprocess::SubprocessMode;
 
 let mode = SubprocessMode::Command {
     command: "/usr/bin/env".into(),
@@ -362,7 +365,7 @@ The body uses standard base64:
 ```rust
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use solti_model::SubprocessMode;
+use solti_exec::subprocess::SubprocessMode;
 
 let mode = SubprocessMode::Script {
     interpreter: "/bin/sh".into(),

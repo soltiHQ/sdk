@@ -10,9 +10,8 @@ use std::{
 use parking_lot::{Condvar, Mutex};
 use solti_chain::{ChainRunner, ChainSpec, ChainStep};
 use solti_model::{
-    AdmissionPolicy, ConditionStatus, EmbeddedSpec, Flag, LabelSelector, Labels, Slot,
-    SubprocessMode, SubprocessSpec, TaskEnv, TaskPhase, TaskSpec, TaskWorkload, Uid,
-    WORKLOAD_API_VERSION, WorkloadTypeMeta,
+    AdmissionPolicy, ConditionStatus, EmbeddedSpec, LabelSelector, Labels, Slot, TaskPhase,
+    TaskSpec, TaskWorkload, Uid, Workload, WorkloadDecl,
 };
 use solti_runner::{BuildContext, RunId, Runner, RunnerError};
 use taskvisor::{
@@ -82,15 +81,7 @@ fn embedded(name: &str, timeout_ms: u64) -> TaskManifest {
 }
 
 fn routed(name: &str, timeout_ms: u64) -> TaskManifest {
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "true".into(),
-            args: vec![],
-        },
-        TaskEnv::default(),
-        None,
-        Flag::enabled(),
-    ));
+    let workload = subprocess_workload();
     TaskManifest::new(
         name,
         TaskSpec::builder("routed-slot", workload, timeout_ms)
@@ -101,15 +92,7 @@ fn routed(name: &str, timeout_ms: u64) -> TaskManifest {
 }
 
 fn routed_to(name: &str, timeout_ms: u64, backend: &str) -> TaskManifest {
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "true".into(),
-            args: vec![],
-        },
-        TaskEnv::default(),
-        None,
-        Flag::enabled(),
-    ));
+    let workload = subprocess_workload();
     let mut labels = Labels::new();
     labels.insert("backend", backend);
     TaskManifest::new(
@@ -122,8 +105,23 @@ fn routed_to(name: &str, timeout_ms: u64, backend: &str) -> TaskManifest {
     .unwrap()
 }
 
-fn subprocess_workload_types() -> Vec<WorkloadTypeMeta> {
-    vec![WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").expect("built-in workload GVK")]
+const EXEC_API_VERSION: &str = "exec.solti.io/v1";
+
+fn subprocess_body() -> Workload {
+    Workload::new(
+        EXEC_API_VERSION,
+        "Subprocess",
+        serde_json::json!({ "command": "true", "args": [] }),
+    )
+    .expect("valid test workload")
+}
+
+fn subprocess_workload() -> TaskWorkload {
+    TaskWorkload::Routed(subprocess_body())
+}
+
+fn subprocess_workload_types() -> Vec<WorkloadDecl> {
+    vec![WorkloadDecl::object(EXEC_API_VERSION, "Subprocess")]
 }
 
 fn retention_slot(name: &str) -> TaskManifest {
@@ -666,7 +664,7 @@ impl Runner for RecordingRunner {
         "recording"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
         subprocess_workload_types()
     }
 
@@ -693,7 +691,7 @@ impl Runner for IdentityRunner {
         "identity"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
         subprocess_workload_types()
     }
 
@@ -938,7 +936,7 @@ async fn runtime_source_must_match_the_declared_workload_before_commit() {
 #[tokio::test]
 async fn retained_task_limit_counts_routed_and_embedded_resources() {
     let config = StateConfig::new().try_with_max_retained_tasks(2).unwrap();
-    let api = SupervisorApi::builder(RunnerRouter::new())
+    let api = SupervisorApi::builder(subprocess_router())
         .with_state_config(config)
         .start()
         .await
@@ -1117,7 +1115,7 @@ async fn conditional_per_id_operations_share_visibility_and_the_resource_operati
 
 #[tokio::test]
 async fn checked_cancel_rejects_stale_uid_and_retains_desired_state() {
-    let api = api(RunnerRouter::new()).await;
+    let api = api(subprocess_router()).await;
     let task = api
         .create_task(routed("checked-cancel", 1_000))
         .await
@@ -1144,7 +1142,7 @@ async fn checked_cancel_rejects_stale_uid_and_retains_desired_state() {
 
 #[tokio::test]
 async fn checked_delete_rejects_stale_uid_before_removing_the_resource() {
-    let api = api(RunnerRouter::new()).await;
+    let api = api(subprocess_router()).await;
     let task = api
         .create_task(routed("checked-delete", 1_000))
         .await
@@ -1267,7 +1265,7 @@ async fn conditional_run_continuation_does_not_require_a_current_task() {
 
 #[tokio::test]
 async fn conditional_apply_cannot_replace_a_hidden_existing_resource() {
-    let api = api(RunnerRouter::new()).await;
+    let api = api(subprocess_router()).await;
     let embedded = api
         .create_embedded_task(embedded("hidden-apply", 10_000), cancellable_task())
         .await
@@ -1301,10 +1299,10 @@ async fn conditional_apply_cannot_replace_a_hidden_existing_resource() {
 
 #[tokio::test]
 async fn preflight_failure_is_retained_in_reconciled_condition() {
-    let api = api(RunnerRouter::new()).await;
+    let api = api(failing_build_router()).await;
 
     let task = api
-        .create_task(routed("no-runner", 1_000))
+        .create_task(routed("build-fails", 1_000))
         .await
         .expect("valid desired state is retained");
 
@@ -1314,13 +1312,13 @@ async fn preflight_failure_is_retained_in_reconciled_condition() {
     assert_eq!(failed.status().phase(), TaskPhase::Pending);
     assert_eq!(failed.status().attempt(), 0);
     assert!(failed.status().error().is_none());
-    assert_eq!(failed.status().reconciled().reason(), "RunnerNotFound");
+    assert_eq!(failed.status().reconciled().reason(), "RunnerBuildFailed");
     assert!(
         failed
             .status()
             .reconciled()
             .message()
-            .contains("no runner matches")
+            .contains("build refused")
     );
     assert_eq!(api.get_task(task.name()), Some(failed));
     api.shutdown().await.unwrap();
@@ -1334,7 +1332,7 @@ impl Runner for PanicRunner {
         "panic"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
         subprocess_workload_types()
     }
 
@@ -1377,7 +1375,7 @@ async fn runner_panic_is_contained_as_reconciliation_failure() {
 
 #[tokio::test]
 async fn failed_new_generation_does_not_cancel_the_old_runtime() {
-    let api = api(RunnerRouter::new()).await;
+    let api = api(failing_build_router()).await;
     let first = api
         .create_embedded_task(embedded("upgrade", 10_000), cancellable_task())
         .await
@@ -1390,11 +1388,11 @@ async fn failed_new_generation_does_not_cancel_the_old_runtime() {
     assert_eq!(failed.status().observed_generation(), 1);
     let failed = wait_for_reconciled(&api, failed.name(), 2, ConditionStatus::False).await;
     assert_eq!(failed.status().phase(), TaskPhase::Pending);
-    assert_eq!(failed.status().reconciled().reason(), "RunnerNotFound");
+    assert_eq!(failed.status().reconciled().reason(), "RunnerBuildFailed");
     assert_eq!(
         api.reconciler.state.binding_for(first.name()),
         Some(previous),
-        "preflight runs before cancellation"
+        "the build runs before cancellation"
     );
 
     api.delete_task(failed.name()).await.unwrap();
@@ -1436,7 +1434,7 @@ impl Runner for FailOnceBlockingRunner {
         "fail-once-blocking"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
         subprocess_workload_types()
     }
 
@@ -1547,10 +1545,7 @@ async fn conditional_delete_cannot_delete_a_generation_applied_after_its_predica
         let gate = Arc::clone(&gate);
         tokio::spawn(async move {
             api.delete_task_where(&name, WritePreconditions::new(), move |task| {
-                assert!(matches!(
-                    task.spec().workload(),
-                    TaskWorkload::Subprocess(_)
-                ));
+                assert!(matches!(task.spec().workload(), TaskWorkload::Routed(_)));
                 gate.started.store(true, Ordering::Release);
                 let mut open = gate.open.lock();
                 while !*open {
@@ -1621,7 +1616,7 @@ impl Runner for BlockingRunner {
         "blocking"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
         subprocess_workload_types()
     }
 
@@ -1737,7 +1732,7 @@ impl Runner for FirstBuildBlockingRunner {
         "first-build-blocking"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
         subprocess_workload_types()
     }
 
@@ -2318,9 +2313,15 @@ async fn post_bind_panic_releases_the_exact_unsubmitted_binding_before_settlemen
     let cancel_api = Arc::clone(&api);
     let cancel_name = name.clone();
     let cancellation = tokio::spawn(async move { cancel_api.cancel_task(&cancel_name).await });
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
+    // Release the panic only after cancel_task has reached the paused
+    // reconciliation: a fixed number of yields lost that race under load.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !api.reconciler.has_user_cancellation(&name) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancel_task did not reach the paused reconciliation");
     assert!(
         !cancellation.is_finished(),
         "cancel_task must wait for coordinator-owned unwind recovery"
@@ -3542,7 +3543,7 @@ impl Runner for AdmissionRunner {
         self.name
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
         subprocess_workload_types()
     }
 
@@ -3662,7 +3663,7 @@ impl Runner for SynchronizedChainRunner {
         self.name
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
         self.inner.workload_types()
     }
 
@@ -3689,23 +3690,8 @@ impl Runner for SynchronizedChainRunner {
 }
 
 fn one_step_chain(name: &str, backend: Option<&str>) -> TaskManifest {
-    let step = ChainStep::new(
-        "leaf",
-        TaskWorkload::Subprocess(SubprocessSpec::new(
-            SubprocessMode::Command {
-                command: "true".into(),
-                args: vec![],
-            },
-            TaskEnv::default(),
-            None,
-            Flag::enabled(),
-        )),
-    )
-    .unwrap();
-    let workload = ChainSpec::new("leaf", vec![step])
-        .unwrap()
-        .into_workload()
-        .unwrap();
+    let step = ChainStep::new("leaf", subprocess_body()).unwrap();
+    let workload = TaskWorkload::from_body(&ChainSpec::new("leaf", vec![step]).unwrap()).unwrap();
     let mut builder = TaskSpec::builder(format!("{name}-slot"), workload, 1_000_u64);
     if let Some(backend) = backend {
         let mut labels = Labels::new();
@@ -3843,7 +3829,7 @@ impl Runner for CoalescingRunner {
         "coalescing"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
         subprocess_workload_types()
     }
 
@@ -4013,7 +3999,7 @@ impl Runner for DeadlineRunner {
         "deadline"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
         subprocess_workload_types()
     }
 
@@ -4556,4 +4542,102 @@ async fn shutdown_and_drop_close_task_watches() {
         .unwrap();
     drop(dropped_api);
     assert!(dropped_watch.next().await.is_none());
+}
+
+struct DeclaredRunner {
+    name: &'static str,
+    workload_types: Vec<WorkloadDecl>,
+    builds: Arc<AtomicUsize>,
+}
+
+#[solti_runner::async_trait]
+impl Runner for DeclaredRunner {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        self.workload_types.clone()
+    }
+
+    async fn build_task(
+        &self,
+        _task: &Task,
+        _run_id: &RunId,
+        _ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
+    ) -> Result<TaskRef, RunnerError> {
+        self.builds.fetch_add(1, Ordering::AcqRel);
+        Ok(immediate_task())
+    }
+}
+
+fn subprocess_decl(
+    check: impl Fn(&Workload) -> Result<(), String> + Send + Sync + 'static,
+) -> WorkloadDecl {
+    WorkloadDecl::new(
+        EXEC_API_VERSION,
+        "Subprocess",
+        &serde_json::json!({ "$schema": solti_model::WORKLOAD_SCHEMA_DIALECT, "type": "object" }),
+        check,
+    )
+}
+
+fn accepting_decl() -> WorkloadDecl {
+    subprocess_decl(|_| Ok(()))
+}
+
+fn declared(
+    name: &'static str,
+    decl: WorkloadDecl,
+    builds: &Arc<AtomicUsize>,
+) -> Arc<DeclaredRunner> {
+    Arc::new(DeclaredRunner {
+        name,
+        workload_types: vec![decl],
+        builds: Arc::clone(builds),
+    })
+}
+
+struct FailingBuildRunner;
+
+#[solti_runner::async_trait]
+impl Runner for FailingBuildRunner {
+    fn name(&self) -> &str {
+        "failing-build"
+    }
+
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        subprocess_workload_types()
+    }
+
+    async fn build_task(
+        &self,
+        _task: &Task,
+        _run_id: &RunId,
+        _ctx: &BuildContext,
+        _cancellation: &solti_runner::BuildCancellation,
+        _scope: &mut solti_runner::BuildScope,
+    ) -> Result<TaskRef, RunnerError> {
+        Err(RunnerError::Internal("build refused".into()))
+    }
+}
+
+fn failing_build_router() -> RunnerRouter {
+    let mut router = RunnerRouter::new();
+    router.register(Arc::new(FailingBuildRunner)).unwrap();
+    router
+}
+
+fn subprocess_router() -> RunnerRouter {
+    let mut router = RunnerRouter::new();
+    router
+        .register(declared(
+            "subprocess",
+            accepting_decl(),
+            &Arc::new(AtomicUsize::new(0)),
+        ))
+        .unwrap();
+    router
 }

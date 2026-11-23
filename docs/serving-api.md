@@ -229,14 +229,18 @@ HTTP errors use a Kubernetes-style `Status` body.
 Task API `429` responses do not include `Retry-After`.
 The [error contract](../crates/solti-api/CONTRACT.md#errors) gives the matching gRPC status codes.
 
-Built-in Subprocess, Container, and Wasm values have public representations.
-This does not mean that a compatible runner is installed.
-Application extension workloads are public, including Chain.
+Every routed workload travels as its JSON body under its GVK: `Task.spec.workload.spec` over HTTP and `TaskWorkload.extension.spec.raw` over gRPC.
+`exec.solti.io/v1` `Subprocess` and `Container`, `chain.solti.io/v1alpha1` `Chain` and application-declared types are all public in this form.
+The transports do not interpret the body: core admits it with the first matching runner's declared check, and a refusal is HTTP `400` or gRPC `InvalidArgument`.
+That a body is accepted does not mean that a compatible runner is installed on every agent.
+The typed gRPC workload messages of 0.0.8 are gone; see [migrating from 0.0.8 to 0.0.9](migrating-from-0-0.md).
 Embedded workloads are in-process only: transports reject their input and the core adapter hides their resources, runs, and output.
 
 Custom `ApiHandler` implementations must preserve public visibility and the documented query/continuation contract.
 The transports reject inconsistent pages or an Embedded value returned by a handler.
 Core-specific reconciliation and snapshot behavior comes from `SupervisorApiAdapter`, not from the trait alone.
+So does body admission: the transports check only the GVK and that the body is a JSON object, and a handler that does not go through `SupervisorApi` gets no admission at all.
+Such a handler must call `RunnerRouter::validate` on the task's spec itself before it stores the task, and answer a refusal with `ApiError::InvalidRequest`, which clients receive as HTTP `400` or gRPC `InvalidArgument`.
 
 Source: [handler contract](../crates/solti-api/src/handler.rs), [core adapter](../crates/solti-api/src/adapter.rs), [HTTP implementation](../crates/solti-api/src/http.rs), and [public behavior](../crates/solti-api/CONTRACT.md).
 

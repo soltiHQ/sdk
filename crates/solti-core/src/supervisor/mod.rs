@@ -335,7 +335,8 @@ impl SupervisorApi {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::InvalidSpec`] for invalid desired state or an embedded workload.
+    /// Returns [`CoreError::InvalidSpec`] for invalid desired state, an embedded workload, or a routed
+    /// body that no runner declares or the first matching runner rejects.
     /// Returns [`CoreError::AlreadyExists`] when the name is retained.
     /// Returns [`CoreError::RetainedTaskLimitReached`] when a new name cannot be retained.
     /// Returns [`CoreError::RetainedTaskManifestByteLimitExceeded`] when the
@@ -392,7 +393,8 @@ impl SupervisorApi {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::InvalidSpec`] for invalid desired state or an embedded workload.
+    /// Returns [`CoreError::InvalidSpec`] for invalid desired state, an embedded workload, or a routed
+    /// body that no runner declares or the first matching runner rejects.
     /// Returns [`CoreError::RetainedTaskLimitReached`] when a missing name cannot be retained.
     /// Returns [`CoreError::RetainedTaskManifestByteLimitExceeded`] when a
     /// missing manifest or positive growth would exceed the retained byte budget.
@@ -545,7 +547,7 @@ impl SupervisorApi {
     ) -> Result<ScheduledWrite, CoreError> {
         let name = manifest.name().clone();
         let source = guard_runtime_source(source, name.clone());
-        Self::ensure_runtime_contract(&manifest, source.as_ref())?;
+        Self::ensure_source_matches_workload(&manifest, source.as_ref())?;
         let operation = self.task_operations.lock(&name).await;
         if self.shutdown_started.load(Ordering::Acquire) {
             drop(operation);
@@ -591,7 +593,7 @@ impl SupervisorApi {
             operation,
             admission,
         } = guards;
-        if let Err(error) = Self::ensure_runtime_contract(&manifest, source.as_ref()) {
+        if let Err(error) = self.ensure_runtime_contract(&manifest, source.as_ref()) {
             drop(admission);
             drop(operation);
             source.dispose_at("runtime_contract_rejected");
@@ -656,7 +658,26 @@ impl SupervisorApi {
         })
     }
 
+    /// Every write path ends in [`Self::write_locked`], which calls this before anything is committed.
+    ///
+    /// A routed task is admitted only when the runner that routing picks for it accepts the body.
     fn ensure_runtime_contract(
+        &self,
+        manifest: &TaskManifest,
+        source: &RuntimeSource,
+    ) -> Result<(), CoreError> {
+        Self::ensure_source_matches_workload(manifest, source)?;
+        if matches!(manifest.spec().workload(), TaskWorkload::Routed(_)) {
+            self.reconciler
+                .validate_workload(manifest.spec())
+                .map_err(|error| {
+                    CoreError::InvalidSpec(ModelError::Invalid(error.to_string().into()))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn ensure_source_matches_workload(
         manifest: &TaskManifest,
         source: &RuntimeSource,
     ) -> Result<(), CoreError> {

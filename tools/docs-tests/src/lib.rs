@@ -45,3 +45,4 @@ markdown_doctest!(
 markdown_doctest!(CommonMistakesGuide, "../../../docs/common-mistakes.md");
 markdown_doctest!(ExampleCatalogGuide, "../../../docs/example-catalog.md");
 markdown_doctest!(ApiReferenceGuide, "../../../docs/api-reference.md");
+markdown_doctest!(MigrationGuide, "../../../docs/migrating-from-0-0.md");

@@ -22,13 +22,14 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use solti_exec::container::ContainerSpec;
 use solti_exec::container::{
     ContainerAttempt, ContainerEngine, ContainerEngineBinding, ContainerEngineError,
     ContainerEngineInfo, ContainerExitStatus, ContainerOutput, ContainerProcessPolicy,
     ContainerRequest, ContainerRunnerConfig, register_container_runner_with_config,
 };
 use solti_exec::isolation::{CgroupLimits, ProcessCredentials, RlimitConfig, SeccompPolicy};
-use solti_model::{ContainerSpec, OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
+use solti_model::{OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
 use solti_runner::{
     BuildContext, OutputPublisher, OutputPublisherHandle, OutputSink, RunnerEnv, RunnerRouter,
 };
@@ -248,12 +249,12 @@ async fn main() -> ExampleResult {
     let mut task_env = TaskEnv::new();
     task_env.push("TASK_VALUE", "from-task");
     task_env.push("SHARED", "from-task");
-    let workload = TaskWorkload::Container(ContainerSpec::new(
+    let workload = TaskWorkload::from_body(&ContainerSpec::new(
         "registry.example/demo-worker:1".into(),
         Some(vec!["demo-worker".into()]),
         vec!["--once".into()],
         task_env,
-    ));
+    ))?;
     let spec = TaskSpec::builder("containers", workload, 30_000_u64).build()?;
     let task = Task::new("demo-container", spec)?;
 

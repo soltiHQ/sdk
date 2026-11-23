@@ -205,6 +205,10 @@ Embedded methods reject every routed workload.
 The router selects a runner by workload GVK and optional labels.
 The runner builds one Taskvisor `TaskRef`.
 
+Admission picks the same runner, the first match in registration order, before any commit, and runs its declared body check.
+`write_locked` does this while it holds the per-task operation lock and the state-write admission permit, so a check must be fast and non-blocking.
+A refusal returns `CoreError::InvalidSpec` and commits nothing.
+
 Embedded submission receives the `TaskRef` from the caller.
 It bypasses runner routing.
 

@@ -1180,8 +1180,8 @@ mod tests {
 
     #[test]
     fn manifest_rejects_payload_above_the_json_budget() {
-        let workload = TaskWorkload::Extension(
-            crate::ExtensionWorkload::new(
+        let workload = TaskWorkload::Routed(
+            crate::Workload::new(
                 "tasks.example.io/v1",
                 "Large",
                 serde_json::json!({ "payload": "x".repeat(MAX_TASK_MANIFEST_BYTES) }),
@@ -1198,8 +1198,8 @@ mod tests {
 
     #[test]
     fn manifest_setters_preserve_the_json_budget() {
-        let workload = TaskWorkload::Extension(
-            crate::ExtensionWorkload::new(
+        let workload = TaskWorkload::Routed(
+            crate::Workload::new(
                 "tasks.example.io/v1",
                 "Large",
                 serde_json::json!({
@@ -1222,8 +1222,8 @@ mod tests {
     #[test]
     fn stored_task_parts_enforce_the_desired_manifest_budget() {
         let stored = task();
-        let oversized = TaskWorkload::Extension(
-            crate::ExtensionWorkload::new(
+        let oversized = TaskWorkload::Routed(
+            crate::Workload::new(
                 "tasks.example.io/v1",
                 "Large",
                 serde_json::json!({ "payload": "x".repeat(MAX_TASK_MANIFEST_BYTES) }),

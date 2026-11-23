@@ -1,8 +1,6 @@
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use solti_model::{
-    AdmissionPolicy, BackoffPolicy, ContainerSpec, EmbeddedSpec, Flag, JitterPolicy, LabelSelector,
-    Labels, RestartPolicy, SelectorRequirement, SubprocessMode, SubprocessSpec, Task, TaskEnv,
-    TaskPhase, TaskRun, TaskSpec, TaskWorkload, WasmSpec,
+    AdmissionPolicy, BackoffPolicy, EmbeddedSpec, JitterPolicy, LabelSelector, Labels,
+    RestartPolicy, SelectorRequirement, Task, TaskPhase, TaskRun, TaskSpec, TaskWorkload,
 };
 
 fn embedded(revision: &str) -> TaskWorkload {
@@ -40,110 +38,6 @@ fn roundtrip(task: &Task) {
     let back: Task = serde_json::from_str(&json1).expect("deserialize");
     let json2 = serde_json::to_string(&back).expect("reserialize");
     assert_eq!(json1, json2, "roundtrip drift");
-}
-
-#[test]
-fn built_in_workload_variants_roundtrip() {
-    let spec = fully_populated_spec(TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "/usr/bin/make".into(),
-            args: vec!["-j4".into(), "test".into()],
-        },
-        {
-            let mut e = TaskEnv::new();
-            e.push("LANG", "C.UTF-8");
-            e.push("BUILD_ID", "42");
-            e
-        },
-        Some(std::path::PathBuf::from("/workspace")),
-        Flag::enabled(),
-    )));
-    let mut task = Task::new("task-sub-cmd", spec).unwrap();
-    task.transition_starting(1, 1, "1").unwrap();
-    task.transition_finished(1, 1, TaskPhase::Failed, Some("retry".into()), None, "2")
-        .unwrap();
-    task.transition_starting(1, 2, "3").unwrap();
-    task.transition_finished(1, 2, TaskPhase::Failed, Some("retry-2".into()), None, "4")
-        .unwrap();
-    task.transition_starting(1, 3, "5").unwrap();
-    let command = task;
-
-    let spec = fully_populated_spec(TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Script {
-            interpreter: "ruby".into(),
-            body: BASE64.encode(b"puts 'ok'"),
-            args: vec![],
-        },
-        TaskEnv::new(),
-        None,
-        Flag::disabled(),
-    )));
-    let script = Task::new("task-script", spec).unwrap();
-
-    let spec = fully_populated_spec(TaskWorkload::Wasm(WasmSpec::new(
-        std::path::PathBuf::from("/modules/report.wasm"),
-        vec!["--format=json".into()],
-        TaskEnv::new(),
-    )));
-    let wasm = Task::new("task-wasm", spec).unwrap();
-
-    let spec = fully_populated_spec(TaskWorkload::Container(ContainerSpec::new(
-        "registry.example.com/build:v1.2.3".into(),
-        Some(vec!["sh".into(), "-c".into()]),
-        vec!["echo hi".into()],
-        TaskEnv::new(),
-    )));
-    let mut task = Task::new("task-ctr", spec).unwrap();
-    task.transition_starting(1, 1, "1").unwrap();
-    task.transition_finished(
-        1,
-        1,
-        TaskPhase::Failed,
-        Some("SIGKILL".into()),
-        Some(137),
-        "2",
-    )
-    .unwrap();
-    let container = task;
-
-    for task in [&command, &script, &wasm, &container] {
-        roundtrip(task);
-    }
-}
-
-#[test]
-fn wire_paths_preserve_unicode_exactly_in_json() {
-    let cwd = std::path::PathBuf::from("/工作/δ");
-    let subprocess = TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "echo".into(),
-            args: Vec::new(),
-        },
-        TaskEnv::default(),
-        Some(cwd.clone()),
-        Flag::enabled(),
-    ));
-    let json = serde_json::to_value(&subprocess).unwrap();
-    assert_eq!(json["spec"]["cwd"], "/工作/δ");
-    let decoded: TaskWorkload = serde_json::from_value(json).unwrap();
-    assert!(matches!(
-        decoded,
-        TaskWorkload::Subprocess(SubprocessSpec { cwd: Some(actual), .. }) if actual == cwd
-    ));
-
-    let module = std::path::PathBuf::from("/модули/报告.wasm");
-    let wasm = TaskWorkload::Wasm(WasmSpec::new(
-        module.clone(),
-        Vec::new(),
-        TaskEnv::default(),
-    ));
-    let json = serde_json::to_value(&wasm).unwrap();
-    assert_eq!(json["spec"]["module"], "/модули/报告.wasm");
-    let decoded: TaskWorkload = serde_json::from_value(json).unwrap();
-    assert!(matches!(
-        decoded,
-        TaskWorkload::Wasm(WasmSpec { module: actual, .. }) if actual == module
-    ));
 }
 
 #[test]

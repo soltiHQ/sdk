@@ -8,6 +8,4 @@ http_discovery:
 grpc:
   addr: 127.0.0.1:50061
 cluster:
-  backend: standalone
-  standalone:
-    data_dir: data/podium-example
+  backend: memory

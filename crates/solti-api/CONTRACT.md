@@ -73,25 +73,24 @@ Every operation delegates to one `ApiHandler` method.
 
 ## Public workloads
 
-The public API accepts these built-in workloads:
+Every workload is a routed `{apiVersion, kind, spec}` envelope.
+The API group must not be `solti.io`.
+The `spec` must be a JSON object, nested at most 128 levels deep.
+The transports do not interpret the body.
+The runner that declares the GVK checks it against its schema at admission.
 
-- `solti.io/v1`, kind `Subprocess`;
-- `solti.io/v1`, kind `Wasm`;
-- `solti.io/v1`, kind `Container`.
-
-It also accepts application-provided workload GVKs.
-Their API group must not be `solti.io`.
-Their `spec` must be a JSON object.
-
-Built-in workload specs reject unknown fields.
-Extension workload fields are owned by the application.
+The typed gRPC `subprocess`, `wasm` and `container` fields were removed in Task API contract 0.2; their field numbers and names are reserved.
+An old client that still sets one sends a field this contract does not know: it is skipped, and the workload arrives without a body.
+A gRPC workload with no `extension.spec.raw`, an old client's included, is refused with `InvalidArgument`:
+`missing workload body: set TaskWorkload.extension.spec.raw (the typed subprocess, wasm and container fields were removed in Task API contract 0.2)`.
 
 `chain.solti.io/v1alpha1`, kind `Chain`, uses this extension boundary.
 HTTP places the Chain object directly in `Task.spec.workload.spec`.
-gRPC places the UTF-8 JSON bytes of that same Chain spec in `ExtensionTask.spec.raw`.
+gRPC places the UTF-8 JSON bytes of that same Chain spec in `extension.spec.raw`.
 
-The transports validate the extension GVK and require an object payload.
-The Chain runner validates its entry, steps, transitions, reachability, and acyclicity when core reconciles the Task.
+The transports validate the GVK and require an object payload.
+Through `SupervisorApiAdapter`, core admits the Task before it stores anything: the Chain runner validates its entry, steps, transitions, reachability, and acyclicity, and checks each step's workload with the runner that would run it.
+A refusal is `InvalidArgument` over gRPC and `400` over HTTP, and nothing is stored.
 Chain remains one outer Task, existing Task status, run history, and output messages require no extra fields.
 
 The built-in `solti.io/v1` `Embedded` workload is SDK-only.
@@ -116,7 +115,7 @@ It contains caller-owned desired state.
   "spec": {
     "slot": "reports",
     "workload": {
-      "apiVersion": "solti.io/v1",
+      "apiVersion": "exec.solti.io/v1",
       "kind": "Subprocess",
       "spec": {
         "mode": {
@@ -507,7 +506,7 @@ The response shape is:
   "runs": [
     {
       "workload": {
-        "apiVersion": "solti.io/v1",
+        "apiVersion": "exec.solti.io/v1",
         "kind": "Subprocess"
       },
       "generation": 1,
@@ -701,10 +700,7 @@ The complete service method prefix is:
 
 Resource and live-output timestamps are Unix milliseconds.
 Output chunks contain raw protobuf bytes.
-`Subprocess.cwd` and `Wasm.module` carry exact UTF-8 text in both HTTP JSON and
-protobuf. Native paths that are not valid UTF-8 are rejected; no wire encoder
-performs lossy substitution.
-Extension workload specs contain one UTF-8 JSON object in `RawExtension.raw`.
+Every workload body is one UTF-8 JSON object in `TaskWorkload.extension.spec.raw` (`RawExtension.raw`).
 For a Chain workload, `TaskWorkload.api_version` is `chain.solti.io/v1alpha1`, `kind` is `Chain`, and `RawExtension.raw` contains the serialized `ChainSpec` object.
 Protobuf JSON represents those bytes as base64; generated clients pass the UTF-8 bytes directly.
 

@@ -6,8 +6,8 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use solti_chain::{ChainRunner, ChainSpec, ChainStep, FailureMode, register_chain_runner};
 use solti_model::{
-    ExtensionWorkload, LabelSelector, Labels, OutputEvent, StreamKind, Task, TaskId, TaskSpec,
-    TaskWorkload, WorkloadTypeMeta,
+    LabelSelector, Labels, OutputEvent, StreamKind, Task, TaskId, TaskSpec, TaskWorkload, Workload,
+    WorkloadDecl,
 };
 use solti_runner::{
     BuildContext, OutputPublisher, OutputPublisherHandle, OutputSink, RouterError, RunId, Runner,
@@ -46,11 +46,8 @@ impl Runner for LeafRunner {
         self.name
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-        vec![
-            WorkloadTypeMeta::new(TEST_API_VERSION, TEST_KIND)
-                .expect("test workload GVK must be valid"),
-        ]
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        vec![WorkloadDecl::object(TEST_API_VERSION, TEST_KIND)]
     }
 
     async fn build_task(
@@ -118,15 +115,15 @@ impl Runner for LeafRunner {
 }
 
 fn leaf_fields(task: &Task) -> Result<(String, String), RunnerError> {
-    let TaskWorkload::Extension(workload) = task.spec().workload() else {
+    let TaskWorkload::Routed(workload) = task.spec().workload() else {
         return Err(RunnerError::UnsupportedWorkload {
             runner: "test-leaf".to_owned(),
             api_version: task.spec().workload().api_version().to_owned(),
             kind: task.spec().workload().kind().to_owned(),
         });
     };
-    let id = string_field(workload.spec(), "id")?;
-    let behavior = string_field(workload.spec(), "behavior")?;
+    let id = string_field(workload.body(), "id")?;
+    let behavior = string_field(workload.body(), "behavior")?;
     Ok((id, behavior))
 }
 
@@ -137,27 +134,22 @@ fn string_field(spec: &Value, field: &str) -> Result<String, RunnerError> {
         .ok_or_else(|| RunnerError::InvalidSpec(format!("missing string field '{field}'")))
 }
 
-fn leaf(id: &str, behavior: &str) -> TaskWorkload {
+fn leaf(id: &str, behavior: &str) -> Workload {
     extension(TEST_KIND, json!({ "id": id, "behavior": behavior }))
 }
 
-fn missing_leaf(id: &str) -> TaskWorkload {
+fn missing_leaf(id: &str) -> Workload {
     extension(MISSING_KIND, json!({ "id": id, "behavior": "ok" }))
 }
 
-fn extension(kind: &str, spec: Value) -> TaskWorkload {
-    TaskWorkload::Extension(
-        ExtensionWorkload::new(TEST_API_VERSION, kind, spec)
-            .expect("test extension workload must be valid"),
-    )
+fn extension(kind: &str, spec: Value) -> Workload {
+    Workload::new(TEST_API_VERSION, kind, spec).expect("test workload must be valid")
 }
 
 fn chain_task(name: &str, chain: ChainSpec) -> Task {
     let spec = TaskSpec::builder(
         format!("{name}-slot"),
-        chain
-            .into_workload()
-            .expect("test chain workload must serialize"),
+        TaskWorkload::from_body(&chain).expect("test chain workload must serialize"),
         10_000_u64,
     )
     .build()
@@ -168,9 +160,7 @@ fn chain_task(name: &str, chain: ChainSpec) -> Task {
 fn chain_task_with_selector(name: &str, chain: ChainSpec, selector: LabelSelector) -> Task {
     let spec = TaskSpec::builder(
         format!("{name}-slot"),
-        chain
-            .into_workload()
-            .expect("test chain workload must serialize"),
+        TaskWorkload::from_body(&chain).expect("test chain workload must serialize"),
         10_000_u64,
     )
     .runner_selector(selector)
@@ -683,8 +673,8 @@ impl Runner for CoordinatedForwardingLeafRunner {
         "coordinated-leaf"
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-        vec![WorkloadTypeMeta::new(TEST_API_VERSION, TEST_KIND).unwrap()]
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        vec![WorkloadDecl::object(TEST_API_VERSION, TEST_KIND)]
     }
 
     async fn build_task(

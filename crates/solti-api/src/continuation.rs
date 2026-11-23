@@ -366,7 +366,7 @@ mod tests {
     use super::*;
     use solti_model::{
         EmbeddedSpec, Slot, TaskId, TaskPhase, TaskRun, TaskSpec, TaskWorkload, Uid,
-        WORKLOAD_API_VERSION, WorkloadTypeMeta,
+        WorkloadTypeMeta,
     };
 
     fn task(name: &str) -> Task {
@@ -384,7 +384,7 @@ mod tests {
         TaskRun::starting(
             1,
             attempt,
-            WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap(),
+            WorkloadTypeMeta::new("exec.solti.io/v1", "Subprocess").unwrap(),
         )
         .unwrap()
     }

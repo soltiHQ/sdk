@@ -21,10 +21,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use solti_exec::subprocess::register_subprocess_runner;
-use solti_model::{
-    Flag, OutputEvent, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskId, TaskSpec,
-    TaskWorkload,
-};
+use solti_exec::subprocess::{SubprocessMode, SubprocessSpec};
+use solti_model::{Flag, OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
 use solti_runner::{OutputPublisher, OutputPublisherHandle, OutputSink, RunnerRouter};
 use taskvisor::TaskContext;
 
@@ -89,7 +87,7 @@ async fn main() -> ExampleResult {
 
     let mut env = TaskEnv::new();
     env.push("MODE", "script");
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Script {
             interpreter: "/bin/sh".into(),
             body: encoded,
@@ -98,7 +96,7 @@ async fn main() -> ExampleResult {
         env,
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("scripts", workload, 5_000_u64).build()?;
     let task = Task::new("render-script", spec)?;
 

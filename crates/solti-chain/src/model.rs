@@ -3,22 +3,26 @@
 use std::collections::{HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
-use solti_model::{ExtensionWorkload, LabelSelector, TaskId, TaskWorkload};
+use solti_model::{LabelSelector, TaskId, Workload, WorkloadBody};
 
 use crate::{ChainError, ChainResult};
 
-/// API group and version of the chain extension workload.
+/// API group and version of the chain workload type.
 pub const CHAIN_API_VERSION: &str = "chain.solti.io/v1alpha1";
 
-/// Kind of the chain extension workload.
+/// Kind of the chain workload type.
 pub const CHAIN_KIND: &str = "Chain";
 
 /// Failure-state behavior after following an `onFailure` transition.
 ///
 /// `Preserve` is the wire default.
 /// Omitting `mode` has the same meaning as writing `mode: preserve`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[schemars(
+    description = "Failure-state behavior after following an onFailure transition. Omitting mode means preserve."
+)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum FailureMode {
@@ -31,9 +35,8 @@ pub enum FailureMode {
 }
 
 /// Transition selected when a step fails.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FailureTransition {
     next: TaskId,
@@ -71,18 +74,15 @@ impl FailureTransition {
 }
 
 /// One executable step in a [`ChainSpec`].
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schema", schemars(!try_from, deny_unknown_fields))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(!try_from, deny_unknown_fields)]
+#[schemars(description = "One executable step in a chain.")]
 #[serde(rename_all = "camelCase", try_from = "raw::ChainStepRaw")]
 pub struct ChainStep {
     name: TaskId,
 
-    #[cfg_attr(
-        feature = "schema",
-        schemars(schema_with = "crate::schema::chain_step_workload")
-    )]
-    workload: TaskWorkload,
+    #[schemars(schema_with = "crate::schema::chain_step_workload")]
+    workload: Workload,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runner_selector: Option<LabelSelector>,
@@ -98,12 +98,13 @@ impl ChainStep {
     /// Creates a step without outgoing transitions or a runner selector.
     ///
     /// Step names use the existing [`TaskId`] validator.
-    /// Built-in `Embedded` workloads and a nested workload with this crate's chain GVK are rejected.
+    /// A nested workload with this crate's chain GVK is rejected.
+    /// The body of the workload is checked against its runner at admission, not here.
     ///
     /// # Errors
     ///
-    /// Returns [`ChainError::Invalid`] when the name or workload is invalid or the workload is forbidden inside a v1alpha1 chain.
-    pub fn new(name: impl AsRef<str>, workload: TaskWorkload) -> ChainResult<Self> {
+    /// Returns [`ChainError::Invalid`] when the name or workload is invalid or the workload is a nested chain.
+    pub fn new(name: impl AsRef<str>, workload: Workload) -> ChainResult<Self> {
         let step = Self {
             name: step_name("step.name", name)?,
             workload,
@@ -170,7 +171,7 @@ impl ChainStep {
 
     /// Workload executed by the step.
     #[inline]
-    pub fn workload(&self) -> &TaskWorkload {
+    pub fn workload(&self) -> &Workload {
         &self.workload
     }
 
@@ -197,25 +198,13 @@ impl ChainStep {
             ChainError::Invalid(format!("step name '{}' is invalid: {error}", self.name))
         })?;
 
-        match &self.workload {
-            TaskWorkload::Embedded(_) => {
-                return Err(ChainError::Invalid(format!(
-                    "step '{}' uses forbidden Embedded workload",
-                    self.name
-                )));
-            }
-            TaskWorkload::Extension(extension) if extension_is_chain(extension) => {
-                return Err(ChainError::Invalid(format!(
-                    "step '{}' uses forbidden nested {CHAIN_API_VERSION}/{CHAIN_KIND} workload",
-                    self.name
-                )));
-            }
-            _ => {}
+        if is_chain_workload(&self.workload) {
+            return Err(ChainError::Invalid(format!(
+                "step '{}' uses forbidden nested {CHAIN_API_VERSION}/{CHAIN_KIND} workload",
+                self.name
+            )));
         }
 
-        self.workload.validate().map_err(|error| {
-            ChainError::Invalid(format!("step '{}'.workload is invalid: {error}", self.name))
-        })?;
         if let Some(selector) = &self.runner_selector {
             selector.validate().map_err(|error| {
                 ChainError::Invalid(format!(
@@ -228,18 +217,17 @@ impl ChainStep {
     }
 }
 
-/// Validated desired state of a chain extension workload.
+/// Validated desired state of a chain workload.
 ///
 /// Runtime validation covers graph invariants that JSON Schema cannot express:
 /// transition targets must exist, every step must be reachable from `entry`, and the directed transition graph must be acyclic.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schema", schemars(!try_from, deny_unknown_fields))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(!try_from, deny_unknown_fields)]
 #[serde(rename_all = "camelCase", try_from = "raw::ChainSpecRaw")]
 pub struct ChainSpec {
     entry: TaskId,
 
-    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    #[schemars(length(min = 1))]
     steps: Vec<ChainStep>,
 }
 
@@ -343,108 +331,19 @@ impl ChainSpec {
         validate_acyclic(&edges, indegree)?;
         Ok(())
     }
-
-    /// Encodes this typed spec as a Solti extension workload.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if validation or JSON conversion fails.
-    pub fn into_workload(self) -> ChainResult<TaskWorkload> {
-        self.try_into()
-    }
-
-    /// Decodes and validates a Solti extension workload as a chain.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChainError::UnexpectedWorkload`] for a different GVK and a validation or JSON error for an invalid chain `spec`.
-    pub fn from_workload(workload: &TaskWorkload) -> ChainResult<Self> {
-        workload.try_into()
-    }
 }
 
-/// Returns whether `workload` is the chain extension GVK owned by this crate.
-pub fn is_chain_workload(workload: &TaskWorkload) -> bool {
-    matches!(workload, TaskWorkload::Extension(extension) if extension_is_chain(extension))
+/// Returns whether `workload` is the chain workload type owned by this crate.
+pub fn is_chain_workload(workload: &Workload) -> bool {
+    workload.is::<ChainSpec>()
 }
 
-impl TryFrom<ChainSpec> for ExtensionWorkload {
-    type Error = ChainError;
+impl WorkloadBody for ChainSpec {
+    const API_VERSION: &'static str = CHAIN_API_VERSION;
+    const KIND: &'static str = CHAIN_KIND;
 
-    fn try_from(spec: ChainSpec) -> Result<Self, Self::Error> {
-        spec.validate()?;
-        let value = serde_json::to_value(spec)?;
-        Ok(ExtensionWorkload::new(
-            CHAIN_API_VERSION,
-            CHAIN_KIND,
-            value,
-        )?)
-    }
-}
-
-impl TryFrom<ChainSpec> for TaskWorkload {
-    type Error = ChainError;
-
-    fn try_from(spec: ChainSpec) -> Result<Self, Self::Error> {
-        Ok(Self::Extension(spec.try_into()?))
-    }
-}
-
-impl TryFrom<&ExtensionWorkload> for ChainSpec {
-    type Error = ChainError;
-
-    fn try_from(workload: &ExtensionWorkload) -> Result<Self, Self::Error> {
-        if !extension_is_chain(workload) {
-            return Err(unexpected_workload(workload.api_version(), workload.kind()));
-        }
-        Ok(serde_json::from_value(workload.spec().clone())?)
-    }
-}
-
-impl TryFrom<ExtensionWorkload> for ChainSpec {
-    type Error = ChainError;
-
-    fn try_from(workload: ExtensionWorkload) -> Result<Self, Self::Error> {
-        let (api_version, kind, spec) = workload.into_parts();
-        if api_version != CHAIN_API_VERSION || kind != CHAIN_KIND {
-            return Err(unexpected_workload(&api_version, &kind));
-        }
-        Ok(serde_json::from_value(spec)?)
-    }
-}
-
-impl TryFrom<&TaskWorkload> for ChainSpec {
-    type Error = ChainError;
-
-    fn try_from(workload: &TaskWorkload) -> Result<Self, Self::Error> {
-        match workload {
-            TaskWorkload::Extension(extension) => extension.try_into(),
-            _ => Err(unexpected_workload(workload.api_version(), workload.kind())),
-        }
-    }
-}
-
-impl TryFrom<TaskWorkload> for ChainSpec {
-    type Error = ChainError;
-
-    fn try_from(workload: TaskWorkload) -> Result<Self, Self::Error> {
-        match workload {
-            TaskWorkload::Extension(extension) => extension.try_into(),
-            other => Err(unexpected_workload(other.api_version(), other.kind())),
-        }
-    }
-}
-
-fn extension_is_chain(workload: &ExtensionWorkload) -> bool {
-    workload.api_version() == CHAIN_API_VERSION && workload.kind() == CHAIN_KIND
-}
-
-fn unexpected_workload(api_version: &str, kind: &str) -> ChainError {
-    ChainError::UnexpectedWorkload {
-        expected_api_version: CHAIN_API_VERSION,
-        expected_kind: CHAIN_KIND,
-        api_version: api_version.to_owned(),
-        kind: kind.to_owned(),
+    fn validate(&self) -> Result<(), String> {
+        ChainSpec::validate(self).map_err(|error| error.to_string())
     }
 }
 
@@ -540,7 +439,7 @@ mod raw {
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     pub(super) struct ChainStepRaw {
         name: TaskId,
-        workload: TaskWorkload,
+        workload: Workload,
         #[serde(default)]
         runner_selector: Option<LabelSelector>,
         #[serde(default)]

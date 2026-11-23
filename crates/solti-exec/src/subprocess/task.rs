@@ -38,29 +38,39 @@ impl SubprocessTaskConfig {
         if self.command.trim().is_empty() {
             return Err("subprocess command is empty".into());
         }
-        if self.command.contains('\0') {
-            return Err("subprocess command contains NUL".into());
+        reject_nul("subprocess command", &self.command)?;
+        for arg in &self.args {
+            reject_nul("subprocess argument", arg)?;
         }
-        if self.args.iter().any(|arg| arg.contains('\0')) {
-            return Err("subprocess argument contains NUL".into());
-        }
-        if self
-            .cwd
-            .as_ref()
-            .is_some_and(|cwd| cwd.to_string_lossy().contains('\0'))
-        {
-            return Err("subprocess cwd contains NUL".into());
+        if let Some(cwd) = &self.cwd {
+            reject_nul("subprocess cwd", &cwd.to_string_lossy())?;
         }
         for (name, value) in &self.env {
             validate_env_name(name)?;
-            if value.contains('\0') {
-                return Err(format!(
-                    "environment variable {name:?} contains a NUL value"
-                ));
-            }
+            validate_env_value(name, value)?;
         }
         Ok(())
     }
+}
+
+/// Refuses a NUL byte in `value`, which the operating system cannot pass on.
+///
+/// `what` names the value in the error.
+pub(crate) fn reject_nul(what: &str, value: &str) -> Result<(), String> {
+    if value.contains('\0') {
+        return Err(format!("{what} contains NUL"));
+    }
+    Ok(())
+}
+
+/// Refuses a NUL byte in the value of the environment variable `name`.
+pub(crate) fn validate_env_value(name: &str, value: &str) -> Result<(), String> {
+    if value.contains('\0') {
+        return Err(format!(
+            "environment variable {name:?} contains a NUL value"
+        ));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for SubprocessTaskConfig {

@@ -34,11 +34,8 @@ use std::{env, io, sync::Arc, time::Duration};
 
 use solti::{
     core::{SupervisorApi, TaskWatchSubscription},
-    exec::subprocess::register_subprocess_runner,
-    model::{
-        Flag, RestartPolicy, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskId, TaskManifest,
-        TaskSpec, TaskWorkload,
-    },
+    exec::subprocess::{SubprocessMode, SubprocessSpec, register_subprocess_runner},
+    model::{Flag, RestartPolicy, Task, TaskEnv, TaskId, TaskManifest, TaskSpec, TaskWorkload},
     prometheus::{
         PrometheusCoreStateCollector, PrometheusRunnerMetrics, PrometheusTaskvisorSubscriber,
         Registry, register_build_info, server,
@@ -120,7 +117,7 @@ solti: supervised Prometheus endpoint
     println!("[endpoint] Starting http://{metrics_address}/metrics as an Embedded task.");
 
     let mut watch = supervisor.watch_tasks(&Default::default(), None)?;
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command {
             command: current_executable()?,
             args: vec![CHILD_MODE.into()],
@@ -128,7 +125,7 @@ solti: supervised Prometheus endpoint
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("metrics-example", workload, 30_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;
@@ -143,7 +140,7 @@ solti: supervised Prometheus endpoint
     );
 
     let missing_command = format!("{}.missing", current_executable()?);
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command {
             command: missing_command,
             args: Vec::new(),
@@ -151,7 +148,7 @@ solti: supervised Prometheus endpoint
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("metrics-failure", workload, 30_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;

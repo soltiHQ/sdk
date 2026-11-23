@@ -6,17 +6,17 @@ description: Build Command and Script workloads, own their process resources, an
 # Run subprocesses
 
 A subprocess workload runs a program on the agent host.
-Use `Command` for an executable and an argument vector.
-Use `Script` for a base64-encoded body and an explicit interpreter.
+Use `SubprocessMode::Command` for an executable and an argument vector.
+Use `SubprocessMode::Script` for a base64-encoded body and an explicit interpreter.
 Neither mode provides a filesystem or security sandbox by itself.
 
 ## Participants
 
 | Component | Role and reason to use it |
 |---|---|
-| `solti-model` | Defines `SubprocessSpec`, `Command`, `Script`, task environment, and the outer execution policy. |
+| `solti-model` | Defines the routed workload envelope, task environment, and the outer execution policy. |
 | `solti-runner` | Selects the backend and supplies build cancellation, environment overrides, metrics, and output. |
-| `solti-exec/subprocess` | Validates the workload, spawns attempts, reads pipes, terminates owned process scopes, and owns deferred cleanup. This feature also enables `host-process`. |
+| `solti-exec/subprocess` | Defines `SubprocessSpec` and `SubprocessMode` (`Command` and `Script`), declares the `Subprocess` type with its schema, validates the workload, spawns attempts, reads pipes, terminates owned process scopes, and owns deferred cleanup. This feature also enables `host-process`. |
 | `solti-exec/host-process` | Provides reusable host controls for the subprocess runner or an application-owned process backend. Linux host seccomp also needs `seccomp`. |
 | `solti-core` and Taskvisor | Reconcile and supervise the Task, including admission, timeout, restart, cancellation, output subscriptions, and history. |
 
@@ -59,25 +59,25 @@ It is not the controller queue capacity or the maximum number of Task resources.
 
 ## Describe work without starting a process
 
-The built-in GVK is `solti.io/v1`, kind `Subprocess`.
+The built-in GVK is `exec.solti.io/v1`, kind `Subprocess`.
+The runner declares it with a JSON Schema derived from `SubprocessSpec`; unknown fields are refused.
+Its admission check decodes the body and refuses a script larger than the runner's `max_script_body_bytes`, so an oversized script fails the write rather than the build.
 This factory accepts an executable and arguments chosen by the application:
 
 ```rust
-use solti_model::{
-    Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv,
-    TaskManifest, TaskSpec, TaskWorkload,
-};
+use solti_exec::subprocess::{SubprocessMode, SubprocessSpec};
+use solti_model::{Flag, RestartPolicy, TaskEnv, TaskManifest, TaskSpec, TaskWorkload};
 
 fn command_manifest(
     program: String,
     args: Vec<String>,
 ) -> Result<TaskManifest, Box<dyn std::error::Error>> {
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command { command: program, args },
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("commands", workload, 30_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;
@@ -264,4 +264,4 @@ The host-policy example skips process execution on non-Unix platforms.
 - [Containers and isolation](containers-and-isolation.md): host controls, cgroups, credentials, and seccomp.
 - [Cancellation and shutdown](cancellation-and-shutdown.md): logical settlement and physical ownership.
 - [Example catalog](example-catalog.md): runnable integration paths.
-- Source: [workload model](../crates/solti-model/src/domain/kind/subprocess.rs), [backend configuration](../crates/solti-exec/src/subprocess/backend.rs), [attempt lifecycle](../crates/solti-exec/src/subprocess/runner.rs), [script transport](../crates/solti-exec/src/subprocess/script.rs), and [output reader](../crates/solti-exec/src/output.rs).
+- Source: [workload spec](../crates/solti-exec/src/subprocess/spec.rs), [backend configuration](../crates/solti-exec/src/subprocess/backend.rs), [attempt lifecycle](../crates/solti-exec/src/subprocess/runner.rs), [script transport](../crates/solti-exec/src/subprocess/script.rs), and [output reader](../crates/solti-exec/src/output.rs).

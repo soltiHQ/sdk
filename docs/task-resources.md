@@ -49,9 +49,10 @@ Each workload has its own `apiVersion`, `kind`, and `spec` envelope. This is dis
 
 | Workload | Construction path |
 | --- | --- |
-| `Subprocess`, `Container`, `Wasm` | A registered runner must match the workload's exact group/version and kind. A model variant alone does not install a backend. |
-| `Extension` | Application-owned JSON object and workload identity, implemented by a matching runner. |
-| `Embedded` | Caller supplies a Taskvisor `TaskRef` through an embedded core API. It is not routed. |
+| Routed (`Workload`) | An application-owned JSON object under a GVK, such as `exec.solti.io/v1` `Subprocess`, `chain.solti.io/v1alpha1` `Chain` or your own. A registered runner must declare the exact group/version and kind, and its check admits the body. A model value alone does not install a backend. |
+| `Embedded` | Caller supplies a Taskvisor `TaskRef` through an embedded core API. It is `solti.io/v1` `Embedded`, is not routed, is never declared by a runner and has no HTTP or gRPC form. |
+
+The `solti.io` group is reserved for `Embedded`. There is no `Wasm` workload type; see [declare workload types](routing-and-custom-runners.md#declare-workload-types) for the built-in types and for declaring your own.
 
 `EmbeddedSpec.revision` is a caller-owned implementation revision. It participates in spec equality. The manifest does not contain or serialize the `TaskRef`.
 
@@ -89,7 +90,7 @@ Old runtime observations are tied to their exact resource identity and generatio
 
 ## Validation boundaries
 
-Constructors and deserialization validate the model. Built-in workload specs reject unknown fields. Extension specs preserve application-owned JSON object fields while enforcing the model's structural bounds.
+Constructors and deserialization validate the model. A routed workload's `spec` is an application-owned JSON object; the model enforces its structural bounds (an object, at most 128 levels deep) and the runner's declared schema and check validate its fields when core admits the write. The built-in `Subprocess` and `Container` specs reject unknown fields.
 
 `MAX_TASK_MANIFEST_BYTES` limits compact JSON for caller-owned manifest fields to 4 MiB. The bound is not a transport response limit. Server-owned status and retained run history have separate budgets. Lifecycle diagnostics are bounded by `MAX_TASK_DIAGNOSTIC_BYTES`, a 32 KiB UTF-8-safe prefix.
 
@@ -99,7 +100,7 @@ Some derivation methods, such as `TaskSpec::with_workload`, deliberately do not 
 
 - [Manifest construction example](../crates/solti-model/examples/task_manifest.rs): build and serialize desired state.
 - [Model lifecycle example](../crates/solti-model/examples/task_lifecycle.rs): follow metadata, generation, and status transitions without executing a task.
-- [Task resource implementation](../crates/solti-model/src/resource/task.rs), [status invariants](../crates/solti-model/src/resource/status.rs), and [workload contracts](../crates/solti-model/src/domain/kind/task.rs).
+- [Task resource implementation](../crates/solti-model/src/resource/task.rs), [status invariants](../crates/solti-model/src/resource/status.rs), and [workload contracts](../crates/solti-model/src/domain/workload/task_workload.rs).
 
 ## See also
 

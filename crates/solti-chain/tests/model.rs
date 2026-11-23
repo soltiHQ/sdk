@@ -1,22 +1,15 @@
 use solti_chain::{
     CHAIN_API_VERSION, CHAIN_KIND, ChainSpec, ChainStep, FailureMode, FailureTransition,
-    is_chain_workload,
 };
-use solti_model::{
-    EmbeddedSpec, ExtensionWorkload, Flag, LabelSelector, Labels, SubprocessMode, SubprocessSpec,
-    TaskEnv, TaskWorkload, WORKLOAD_API_VERSION,
-};
+use solti_model::{LabelSelector, Labels, Workload, workload_schema_for};
 
-fn subprocess() -> TaskWorkload {
-    TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "echo".into(),
-            args: vec![],
-        },
-        TaskEnv::default(),
-        None,
-        Flag::enabled(),
-    ))
+fn subprocess() -> Workload {
+    Workload::new(
+        "exec.solti.io/v1",
+        "Subprocess",
+        serde_json::json!({ "mode": { "command": "echo" } }),
+    )
+    .unwrap()
 }
 
 fn valid_chain() -> ChainSpec {
@@ -130,23 +123,6 @@ fn rejects_empty_duplicate_missing_unreachable_and_cyclic_graphs() {
 }
 
 #[test]
-fn rejects_embedded_and_nested_chain_workloads() {
-    let embedded = TaskWorkload::Embedded(EmbeddedSpec::new("v1").unwrap());
-    let error = ChainStep::new("embedded", embedded).unwrap_err();
-    assert!(error.to_string().contains("Embedded"));
-
-    let nested: TaskWorkload = ChainSpec::new(
-        "inner",
-        vec![ChainStep::new("inner", subprocess()).unwrap()],
-    )
-    .unwrap()
-    .try_into()
-    .unwrap();
-    let error = ChainStep::new("nested", nested).unwrap_err();
-    assert!(error.to_string().contains("nested"));
-}
-
-#[test]
 fn validates_step_runner_selectors() {
     let mut labels = Labels::new();
     labels.insert("bad key", "value");
@@ -233,36 +209,8 @@ fn serde_is_strict_and_runs_runtime_validation() {
 }
 
 #[test]
-fn extension_workload_conversion_enforces_the_chain_gvk() {
-    let spec = valid_chain();
-    let workload: TaskWorkload = spec.clone().try_into().unwrap();
-
-    assert!(is_chain_workload(&workload));
-    assert_eq!(workload.api_version(), CHAIN_API_VERSION);
-    assert_eq!(workload.kind(), CHAIN_KIND);
-    assert_eq!(ChainSpec::from_workload(&workload).unwrap(), spec);
-    assert_eq!(ChainSpec::try_from(workload.clone()).unwrap(), spec);
-
-    let TaskWorkload::Extension(extension) = workload else {
-        panic!("chain must use an extension workload");
-    };
-    assert_eq!(ChainSpec::try_from(&extension).unwrap(), spec);
-
-    let other = TaskWorkload::Extension(
-        ExtensionWorkload::new("workflow.example.io/v1", "Chain", serde_json::json!({})).unwrap(),
-    );
-    let error = ChainSpec::from_workload(&other).unwrap_err();
-    assert!(error.to_string().contains(CHAIN_API_VERSION));
-
-    let builtin = subprocess();
-    let error = ChainSpec::from_workload(&builtin).unwrap_err();
-    assert!(error.to_string().contains(WORKLOAD_API_VERSION));
-}
-
-#[cfg(feature = "schema")]
-#[test]
 fn json_schema_is_strict_and_excludes_forbidden_workloads() {
-    let schema = serde_json::to_value(schemars::schema_for!(ChainSpec)).unwrap();
+    let schema = workload_schema_for::<ChainSpec>();
     jsonschema::meta::validate(&schema).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
 
@@ -286,7 +234,7 @@ fn json_schema_is_strict_and_excludes_forbidden_workloads() {
         "steps": [{
             "name": "entry",
             "workload": {
-                "apiVersion": WORKLOAD_API_VERSION,
+                "apiVersion": "solti.io/v1",
                 "kind": "Embedded",
                 "spec": { "revision": "v1" }
             }

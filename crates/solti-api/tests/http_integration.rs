@@ -22,8 +22,8 @@ use solti_api::{
     TaskWatchEventStream, Transport,
 };
 use solti_model::{
-    EmbeddedSpec, ExtensionWorkload, Task, TaskContinuation, TaskFilter, TaskId, TaskManifest,
-    TaskPage, TaskPhase, TaskQuery, TaskRunPage, TaskRunQuery, TaskSpec, TaskWorkload, Token, Uid,
+    EmbeddedSpec, Task, TaskContinuation, TaskFilter, TaskId, TaskManifest, TaskPage, TaskPhase,
+    TaskQuery, TaskRunPage, TaskRunQuery, TaskSpec, TaskWorkload, Token, Uid, Workload,
     WritePreconditions,
 };
 
@@ -1268,8 +1268,8 @@ async fn list_tasks_empty_returns_complete_collection_metadata() {
 #[tokio::test]
 async fn list_tasks_maps_native_oversized_item_to_429() {
     let manifest = |padding: usize| {
-        let workload = TaskWorkload::Extension(
-            ExtensionWorkload::new(
+        let workload = TaskWorkload::Routed(
+            Workload::new(
                 "workloads.example.io/v1",
                 "LargePayload",
                 serde_json::json!({ "padding": "x".repeat(padding) }),

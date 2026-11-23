@@ -40,7 +40,7 @@ These twelve programs use package `solti`.
 | Example | Required features | Process and prerequisites |
 |---|---|---|
 | [`task_subprocess`](../crates/solti/examples/task_subprocess.rs) | `core,exec-subprocess` | Router → core → real child process → output/status/history → cleanup. Runs its own binary; needs a supported subprocess platform, not a shell. |
-| [`task_custom_workload`](../crates/solti/examples/task_custom_workload.rs) | `core` | Custom `TcpProbe` GVK → payload validation → core reconciliation → real local TCP connection. Binds a local test service. |
+| [`task_custom_workload`](../crates/solti/examples/task_custom_workload.rs) | `core,model-schema` | Declared `TcpProbe` type with a derived schema → admission check → core reconciliation → real local TCP connection. Binds a local test service. |
 | [`task_cron`](../crates/solti/examples/task_cron.rs) | `cron,core` | UTC calendar → Embedded Task → two real invocations → cancellation, no subsequent invocation, and joined shutdown. |
 | [`task_chain`](../crates/solti/examples/task_chain.rs) | `chain,core,exec-subprocess` | Four subprocess steps with a failure/recovery path, one outer resource, and shared output. Runs its own binary. |
 | [`task_containerd`](../crates/solti/examples/task_containerd.rs) | `core,exec-containerd` | Native containerd → runner → desired-state lifecycle and cleanup. Requires Linux, containerd 2.x, runtime/snapshotter plugins, and an available image. |
@@ -75,7 +75,7 @@ Continue with [task resources](task-resources.md), [management](managing-tasks.m
 
 | Package | Example | Required features | What it demonstrates and needs |
 |---|---|---|---|
-| `solti-runner` | [`custom_extension`](../crates/solti-runner/examples/custom_extension.rs) | — | Two runners for one custom GVK, label selection, captured capabilities, and a build result without starting it. |
+| `solti-runner` | [`custom_workload`](../crates/solti-runner/examples/custom_workload.rs) | — | Two runners for one declared GVK, label selection, first-match admission, captured capabilities with schema fingerprints, and a build result without starting it. |
 | `solti-runner` | [`build_context`](../crates/solti-runner/examples/build_context.rs) | — | Environment precedence, custom metrics, and attempt-scoped output sequence ownership. |
 | `solti-exec` | [`subprocess_command`](../crates/solti-exec/examples/subprocess_command.rs) | `subprocess` | Real process attempt, cleared/merged environment, pinned working directory, stdout/stderr publication. |
 | `solti-exec` | [`subprocess_script`](../crates/solti-exec/examples/subprocess_script.rs) | `subprocess` | Base64 decoding at build, explicit interpreter, fresh script transport, and two reusable-task attempts. Needs the example's interpreter. |

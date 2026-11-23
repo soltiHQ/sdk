@@ -4,54 +4,38 @@
 //! [`RunnerCapability`] describes one registered runner.
 //!
 //! Runner order is preserved.
-//! Workload GVKs inside each runner are stored in canonical order.
+//! Workload types inside each runner are stored in canonical GVK order.
+//! Each type carries the fingerprint of its schema; the schemas themselves are listed once
+//! per fingerprint by [`AgentCapabilities::schemas`].
 
 use std::collections::HashSet;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::Serialize;
 
-use crate::{Labels, ModelError, ModelResult, WORKLOAD_API_VERSION, WorkloadTypeMeta, validation};
+use crate::{
+    Labels, ModelError, ModelResult, SchemaFingerprint, WorkloadSchema, WorkloadType,
+    WorkloadTypeMeta, domain::workload::in_reserved_group, validation,
+};
 
-const EMBEDDED_WORKLOAD_KIND: &str = "Embedded";
+/// Most runners one agent registers.
+pub const MAX_AGENT_RUNNERS: usize = 64;
 
-/// One registered runner and the workload GVKs it can execute.
+/// Most workload types one runner declares.
+pub const MAX_RUNNER_WORKLOAD_TYPES: usize = 256;
+
+/// Most distinct schema fingerprints one agent declares across its runners.
+pub const MAX_AGENT_WORKLOAD_SCHEMAS: usize = 256;
+
+/// One registered runner and the workload types it can execute.
 ///
 /// Labels are the same static labels used by `runnerSelector`.
+/// A capability is built by the agent, never read back from the wire.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerCapability {
-    #[cfg_attr(
-        feature = "schema",
-        schemars(schema_with = "crate::schema::runner_name")
-    )]
     name: String,
     labels: Labels,
-    #[cfg_attr(
-        feature = "schema",
-        schemars(schema_with = "crate::schema::runner_workload_types")
-    )]
-    workload_types: Vec<WorkloadTypeMeta>,
-}
-
-impl<'de> Deserialize<'de> for RunnerCapability {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct RawRunnerCapability {
-            name: String,
-            #[serde(default)]
-            labels: Labels,
-            workload_types: Vec<WorkloadTypeMeta>,
-        }
-
-        let raw = RawRunnerCapability::deserialize(deserializer)?;
-        Self::new(raw.name, raw.labels, raw.workload_types).map_err(serde::de::Error::custom)
-    }
+    workload_types: Vec<WorkloadType>,
 }
 
 impl RunnerCapability {
@@ -61,11 +45,13 @@ impl RunnerCapability {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when the name or labels are invalid, no workload is declared, a GVK is duplicated, or Embedded is declared.
+    /// Returns [`ModelError::Invalid`] when the name or labels are invalid, no workload type is
+    /// declared, more than [`MAX_RUNNER_WORKLOAD_TYPES`] are, a GVK is duplicated, or a type is in
+    /// the reserved `solti.io` group.
     pub fn new(
         name: impl Into<String>,
         labels: Labels,
-        mut workload_types: Vec<WorkloadTypeMeta>,
+        mut workload_types: Vec<WorkloadType>,
     ) -> ModelResult<Self> {
         let name = name.into();
         if name.is_empty() {
@@ -77,15 +63,30 @@ impl RunnerCapability {
         labels.validate()?;
         if workload_types.is_empty() {
             return Err(ModelError::Invalid(
-                "runner capability must declare at least one workload GVK".into(),
+                "runner capability must declare at least one workload type".into(),
             ));
         }
-        if workload_types.iter().any(|workload| {
-            workload.api_version() == WORKLOAD_API_VERSION
-                && workload.kind() == EMBEDDED_WORKLOAD_KIND
-        }) {
+        if workload_types.len() > MAX_RUNNER_WORKLOAD_TYPES {
             return Err(ModelError::Invalid(
-                "runner capability must not declare the Embedded workload".into(),
+                format!(
+                    "runner capability {name}: {} workload types, over the limit of {MAX_RUNNER_WORKLOAD_TYPES}",
+                    workload_types.len()
+                )
+                .into(),
+            ));
+        }
+        if let Some(reserved) = workload_types
+            .iter()
+            .find(|workload| in_reserved_group(workload.api_version()))
+        {
+            return Err(ModelError::Invalid(
+                format!(
+                    "runner capability {name}: workload {}/{}: {}",
+                    reserved.api_version(),
+                    reserved.kind(),
+                    crate::domain::workload::RESERVED_GROUP_REASON
+                )
+                .into(),
             ));
         }
 
@@ -94,9 +95,12 @@ impl RunnerCapability {
                 .cmp(right.api_version())
                 .then_with(|| left.kind().cmp(right.kind()))
         });
-        if workload_types.windows(2).any(|pair| pair[0] == pair[1]) {
+        if workload_types
+            .windows(2)
+            .any(|pair| pair[0].meta() == pair[1].meta())
+        {
             return Err(ModelError::Invalid(
-                "runner capability contains a duplicate workload GVK".into(),
+                format!("runner capability {name}: duplicate workload GVK").into(),
             ));
         }
 
@@ -119,37 +123,18 @@ impl RunnerCapability {
         &self.labels
     }
 
-    /// Canonically ordered workload GVKs handled by the runner.
+    /// Canonically ordered workload types handled by the runner.
     #[inline]
-    pub fn workload_types(&self) -> &[WorkloadTypeMeta] {
+    pub fn workload_types(&self) -> &[WorkloadType] {
         &self.workload_types
     }
 }
 
 /// Immutable snapshot of agent execution capabilities.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCapabilities {
     runners: Vec<RunnerCapability>,
-}
-
-impl<'de> Deserialize<'de> for AgentCapabilities {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct RawAgentCapabilities {
-            #[serde(default)]
-            runners: Vec<RunnerCapability>,
-        }
-
-        let raw = RawAgentCapabilities::deserialize(deserializer)?;
-        Self::new(raw.runners).map_err(serde::de::Error::custom)
-    }
 }
 
 impl AgentCapabilities {
@@ -157,8 +142,19 @@ impl AgentCapabilities {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Invalid`] when runner names are duplicated.
+    /// Returns [`ModelError::Invalid`] when runner names are duplicated, there are more than
+    /// [`MAX_AGENT_RUNNERS`] runners, or the runners declare more than
+    /// [`MAX_AGENT_WORKLOAD_SCHEMAS`] distinct schema fingerprints.
     pub fn new(runners: Vec<RunnerCapability>) -> ModelResult<Self> {
+        if runners.len() > MAX_AGENT_RUNNERS {
+            return Err(ModelError::Invalid(
+                format!(
+                    "agent capabilities: {} runners, over the limit of {MAX_AGENT_RUNNERS}",
+                    runners.len()
+                )
+                .into(),
+            ));
+        }
         let mut names = HashSet::with_capacity(runners.len());
         if runners
             .iter()
@@ -168,7 +164,17 @@ impl AgentCapabilities {
                 "agent capabilities contain a duplicate runner name".into(),
             ));
         }
-        Ok(Self { runners })
+        let capabilities = Self { runners };
+        let distinct = capabilities.schemas().len();
+        if distinct > MAX_AGENT_WORKLOAD_SCHEMAS {
+            return Err(ModelError::Invalid(
+                format!(
+                    "agent capabilities: {distinct} distinct workload schemas, over the limit of {MAX_AGENT_WORKLOAD_SCHEMAS}"
+                )
+                .into(),
+            ));
+        }
+        Ok(capabilities)
     }
 
     /// Registered runners in routing priority order.
@@ -176,14 +182,56 @@ impl AgentCapabilities {
     pub fn runners(&self) -> &[RunnerCapability] {
         &self.runners
     }
+
+    /// Every distinct schema once, by fingerprint, in first-declaration order.
+    pub fn schemas(&self) -> Vec<&WorkloadSchema> {
+        let mut seen = HashSet::new();
+        self.runners
+            .iter()
+            .flat_map(|runner| runner.workload_types())
+            .filter(|workload| seen.insert(workload.fingerprint()))
+            .map(WorkloadType::schema)
+            .collect()
+    }
+
+    /// GVKs, across all runners in registration order, whose schema has `fingerprint`.
+    pub fn types_for(&self, fingerprint: &SchemaFingerprint) -> Vec<&WorkloadTypeMeta> {
+        self.runners
+            .iter()
+            .flat_map(|runner| runner.workload_types())
+            .filter(|workload| workload.fingerprint() == fingerprint)
+            .map(WorkloadType::meta)
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    fn workload(api_version: &str, kind: &str) -> WorkloadTypeMeta {
-        WorkloadTypeMeta::new(api_version, kind).unwrap()
+    fn schema(tag: &str) -> WorkloadSchema {
+        WorkloadSchema::from_value(&json!({
+            "$schema": crate::WORKLOAD_SCHEMA_DIALECT,
+            "type": "object",
+            "description": tag,
+        }))
+        .unwrap()
+    }
+
+    fn workload(api_version: &str, kind: &str) -> WorkloadType {
+        typed(api_version, kind, "shared")
+    }
+
+    fn typed(api_version: &str, kind: &str, tag: &str) -> WorkloadType {
+        WorkloadType::new(
+            WorkloadTypeMeta::new(api_version, kind).unwrap(),
+            schema(tag),
+        )
+    }
+
+    fn runner(name: &str, types: Vec<WorkloadType>) -> RunnerCapability {
+        RunnerCapability::new(name, Labels::new(), types).unwrap()
     }
 
     #[test]
@@ -193,7 +241,7 @@ mod tests {
             Labels::new(),
             vec![
                 workload("tasks.example.io/v1", "Resize"),
-                workload(WORKLOAD_API_VERSION, "Subprocess"),
+                workload("exec.solti.io/v1", "Subprocess"),
             ],
         )
         .unwrap();
@@ -205,7 +253,7 @@ mod tests {
                 .map(|workload| (workload.api_version(), workload.kind()))
                 .collect::<Vec<_>>(),
             vec![
-                ("solti.io/v1", "Subprocess"),
+                ("exec.solti.io/v1", "Subprocess"),
                 ("tasks.example.io/v1", "Resize"),
             ]
         );
@@ -213,42 +261,10 @@ mod tests {
 
     #[test]
     fn capability_rejects_invalid_registration_data() {
-        assert!(
-            RunnerCapability::new(
-                "",
-                Labels::new(),
-                vec![workload("solti.io/v1", "Subprocess")]
-            )
-            .is_err()
-        );
-        assert!(
-            RunnerCapability::new(
-                "invalid/name",
-                Labels::new(),
-                vec![workload("solti.io/v1", "Subprocess")],
-            )
-            .is_err()
-        );
+        let one = || vec![workload("exec.solti.io/v1", "Subprocess")];
+        assert!(RunnerCapability::new("", Labels::new(), one()).is_err());
+        assert!(RunnerCapability::new("invalid/name", Labels::new(), one()).is_err());
         assert!(RunnerCapability::new("runner", Labels::new(), Vec::new()).is_err());
-        assert!(
-            RunnerCapability::new(
-                "runner",
-                Labels::new(),
-                vec![
-                    workload("solti.io/v1", "Subprocess"),
-                    workload("solti.io/v1", "Subprocess"),
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            RunnerCapability::new(
-                "runner",
-                Labels::new(),
-                vec![workload(WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND)],
-            )
-            .is_err()
-        );
     }
 
     #[test]
@@ -257,7 +273,7 @@ mod tests {
             RunnerCapability::new(
                 name,
                 Labels::new(),
-                vec![workload(WORKLOAD_API_VERSION, "Subprocess")],
+                vec![workload("exec.solti.io/v1", "Subprocess")],
             )
         };
 
@@ -275,41 +291,9 @@ mod tests {
 
     #[test]
     fn capabilities_reject_duplicate_runner_names() {
-        let first = RunnerCapability::new(
-            "runner",
-            Labels::new(),
-            vec![workload(WORKLOAD_API_VERSION, "Subprocess")],
-        )
-        .unwrap();
-        let second = RunnerCapability::new(
-            "runner",
-            Labels::new(),
-            vec![workload("tasks.example.io/v1", "Resize")],
-        )
-        .unwrap();
+        let first = runner("runner", vec![workload("exec.solti.io/v1", "Subprocess")]);
+        let second = runner("runner", vec![workload("tasks.example.io/v1", "Resize")]);
 
         assert!(AgentCapabilities::new(vec![first, second]).is_err());
-    }
-
-    #[test]
-    fn serde_is_strict_and_validated() {
-        let valid = serde_json::json!({
-            "runners": [{
-                "name": "runner",
-                "labels": {"zone": "eu"},
-                "workloadTypes": [{
-                    "apiVersion": "solti.io/v1",
-                    "kind": "Subprocess"
-                }]
-            }]
-        });
-        let capabilities: AgentCapabilities = serde_json::from_value(valid).unwrap();
-        assert_eq!(capabilities.runners()[0].labels().get("zone"), Some("eu"));
-
-        let unknown = serde_json::json!({
-            "runners": [],
-            "unknown": true
-        });
-        assert!(serde_json::from_value::<AgentCapabilities>(unknown).is_err());
     }
 }

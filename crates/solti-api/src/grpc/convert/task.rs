@@ -198,21 +198,20 @@ pub(crate) fn task_watch_event_to_proto(
 mod tests {
     use super::*;
     use solti_model::{
-        EmbeddedSpec, ExtensionWorkload, Flag, SubprocessMode, SubprocessSpec, TaskContinuation,
-        TaskEnv, TaskFilter, TaskId, TaskPhase, TaskSpec, TaskWorkload,
+        EmbeddedSpec, TaskContinuation, TaskFilter, TaskId, TaskPhase, TaskSpec, TaskWorkload,
+        Workload,
     };
     use std::time::UNIX_EPOCH;
 
     fn subprocess_workload() -> TaskWorkload {
-        TaskWorkload::Subprocess(SubprocessSpec::new(
-            SubprocessMode::Command {
-                command: "ls".into(),
-                args: vec![],
-            },
-            TaskEnv::new(),
-            None,
-            Flag::from(true),
-        ))
+        TaskWorkload::Routed(
+            Workload::new(
+                "tasks.example.io/v1",
+                "Echo",
+                serde_json::json!({ "command": "ls" }),
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -378,8 +377,8 @@ mod tests {
     #[test]
     fn max_manifest_task_can_fit_one_native_protobuf_page() {
         let manifest = |padding: usize| {
-            let workload = TaskWorkload::Extension(
-                ExtensionWorkload::new(
+            let workload = TaskWorkload::Routed(
+                Workload::new(
                     "workloads.example.io/v1",
                     "LargePayload",
                     serde_json::json!({ "padding": "x".repeat(padding) }),

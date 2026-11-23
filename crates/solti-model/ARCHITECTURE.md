@@ -52,10 +52,10 @@ It models collections over stored resources.
 | `resource/status.rs`        | Status shape and cross-field invariants                          | Event collection or retry scheduling           |
 | `resource/condition.rs`     | Extensible condition shape and `Reconciled` condition values     | Controller logic                               |
 | `resource/run.rs`           | One active or finished attempt record                            | Run history storage                            |
-| `domain/kind/`              | Built-in and extension workload envelopes                        | Workload execution                             |
+| `domain/workload/`          | Workload envelope, type declarations, schemas and fingerprints   | Workload execution, routing                    |
 | `domain/selector/`          | Kubernetes-style label matching                                  | Runner registration                            |
 | `domain/query/`             | Filters, pagination domain values, watch event values            | Snapshot retention or watch transport          |
-| `domain/capability.rs`      | Immutable runner capability snapshots                            | Routing decisions                              |
+| `domain/capability.rs`      | Immutable runner capability snapshots, with schema fingerprints  | Routing decisions                              |
 | `domain/output.rs`          | Live-output data and JSON encoding                               | Channels, retention, subscriptions             |
 | `auth.rs`                   | Secret loading, generation, redaction, comparison                | Authentication topology, persistence, rotation |
 | `schema.rs`                 | JSON Schema shapes for custom wire encodings                     | OpenAPI routes or transport behavior           |
@@ -254,33 +254,45 @@ Every workload uses a Kubernetes-style envelope:
 %%{init: {"flowchart": {"curve": "linear"}}}%%
 flowchart TB
     Workload["TaskWorkload"]
-    Subprocess["Subprocess<br/>solti.io/v1"]
-    Container["Container<br/>solti.io/v1"]
-    Wasm["Wasm<br/>solti.io/v1"]
+    Routed["Routed<br/>application GVK"]
     Embedded["Embedded<br/>solti.io/v1"]
-    Extension["Extension<br/>application GVK"]
     Runner["solti-runner routing"]
     Binding["Higher-layer in-process binding"]
 
-    Workload --> Subprocess
-    Workload --> Container
-    Workload --> Wasm
+    Workload --> Routed
     Workload --> Embedded
-    Workload --> Extension
 
-    Subprocess --> Runner
-    Container --> Runner
-    Wasm --> Runner
-    Extension --> Runner
+    Routed --> Runner
     Embedded --> Binding
 ```
 
-Built-in variants have fixed kinds and strict specs.
-Unknown built-in fields are rejected.
+`Workload` preserves an application-owned JSON object under a grouped CRD-style GVK.
+The agent declares a JSON Schema per GVK; the control plane validates `spec` against it.
+`WorkloadBody` decodes the object into a typed value.
+The `solti.io` group is reserved for SDK-internal workloads.
 
-`ExtensionWorkload` preserves an application-owned JSON object.
-Its GVK must use a grouped CRD-style API version.
-The `solti.io` group is reserved for built-in workloads.
+A runner declares each type it runs as a `WorkloadDecl`: GVK, `WorkloadSchema` and a body check.
+
+```mermaid
+%%{init: {"flowchart": {"curve": "linear"}}}%%
+flowchart LR
+    Decl["WorkloadDecl<br/>GVK + schema + check"]
+    Schema["WorkloadSchema<br/>canonical JSON + fingerprint"]
+    Type["WorkloadType<br/>GVK + fingerprint"]
+    Capability["RunnerCapability"]
+
+    Decl -->|workload_type| Type
+    Decl --> Schema
+    Schema --> Type
+    Type --> Capability
+```
+
+- `workload/schema/` owns RFC 8785 canonical JSON, the size limit and the fingerprint (`mod.rs`).
+- `workload/generate.rs` derives a schema from a Rust type: draft 2020-12, `unevaluatedProperties` rewritten, 64-bit integers bounded to 2^53 - 1.
+- `workload/decl.rs` keeps an unusable declaration as an error until registration.
+  Its check runs under core's per-task lock and a state-write admission permit, so it must be fast and non-blocking.
+- The canonical bytes are the fingerprint's preimage and are what the agent sends, so the title, `$defs` names and descriptions that schemars writes are part of the contract.
+- Routing is first-match: the first runner, in registration order, whose exact GVK and labels match. The model does not route; `solti-runner` does.
 
 `EmbeddedSpec` contains only the caller-owned implementation revision.
 A higher layer binds that revision to an in-process task handle.
@@ -312,9 +324,10 @@ flowchart LR
 | `TaskSpec`                                    | Slot, timeout, workload, backoff, selector      |
 | `TaskStatus`                                  | Conditions, generations, lifecycle fields       |
 | `TaskRun`                                     | Generation, attempt, phase, finish fields       |
-| `RunnerCapability` and `AgentCapabilities`    | Names, labels, GVKs, uniqueness                 |
+| `RunnerCapability` and `AgentCapabilities`    | Names, labels, GVKs, fingerprints, uniqueness and caps |
+| `WorkloadDecl`                                | GVK, reserved group, schema size                |
 | `TaskFilter` and `TaskContinuation`           | Selector and cursor fields                      |
-| `WorkloadTypeMeta` and extension workloads    | CRD-compatible GVK                              |
+| `WorkloadTypeMeta` and routed workloads       | CRD-compatible GVK                              |
 
 Direct construction or deserialization does not validate `Labels`, `Annotations`, `LabelSelector`, or `SelectorRequirement`.
 Call their `validate` methods before using them outside a top-level validated boundary.
@@ -384,7 +397,7 @@ They do not perform routing.
 %%{init: {"flowchart": {"curve": "linear"}}}%%
 flowchart LR
     Registration["Runner registration"]
-    Runner["RunnerCapability<br/>name + labels + workload GVKs"]
+    Runner["RunnerCapability<br/>name + labels + workload types (GVK + fingerprint)"]
     Agent["AgentCapabilities<br/>ordered runner snapshot"]
     Discovery["Discovery or control plane"]
     Router["solti-runner"]
@@ -401,7 +414,9 @@ Workload GVKs are sorted into canonical order.
 Runner registration order is preserved across `AgentCapabilities`.
 
 The model rejects duplicate runner names and duplicate GVKs.
-It also rejects the built-in Embedded GVK.
+It also rejects the reserved `solti.io` group, so the built-in Embedded GVK cannot be declared.
+It caps an agent at `MAX_AGENT_RUNNERS` runners and `MAX_AGENT_WORKLOAD_SCHEMAS` distinct fingerprints, and a runner at `MAX_RUNNER_WORKLOAD_TYPES` types.
+Types with equal schemas share one fingerprint.
 `solti-runner` owns the final GVK and selector routing decision.
 
 ## Data-only contracts
@@ -428,7 +443,7 @@ Runtime behavior belongs in the crate that owns that runtime.
 | Task wire shape or resource ownership       | [`src/resource/task.rs`](src/resource/task.rs), [`src/resource/metadata.rs`](src/resource/metadata.rs)                                           | task module tests and `tests/serde_roundtrip.rs` |
 | Conditional write contract                  | [`src/resource/preconditions.rs`](src/resource/preconditions.rs)                                                                                 | precondition tests                               |
 | Spec fields or defaults                     | [`src/resource/spec.rs`](src/resource/spec.rs)                                                                                                   | spec tests and README defaults                   |
-| Built-in or extension workload              | [`src/domain/kind/`](src/domain/kind)                                                                                                            | kind tests and `tests/serde_roundtrip.rs`        |
+| Workload envelope or declaration            | [`src/domain/workload/`](src/domain/workload)                                                                                                    | workload tests and `tests/serde_roundtrip.rs`    |
 | Phase or status transition                  | [`src/resource/status.rs`](src/resource/status.rs), [`src/resource/task.rs`](src/resource/task.rs), [`src/domain/phase.rs`](src/domain/phase.rs) | status and task tests                            |
 | Condition semantics                         | [`src/resource/condition.rs`](src/resource/condition.rs)                                                                                         | condition and status tests                       |
 | Attempt record                              | [`src/resource/run.rs`](src/resource/run.rs)                                                                                                     | run tests and `tests/serde_roundtrip.rs`         |
@@ -453,8 +468,8 @@ Before changing a shared contract, check these constraints in the owning module 
 7. Attempt numbers come from the execution source of truth.
 8. Reconciliation errors stay in the `Reconciled` condition.
 9. Execution errors stay in terminal status or run diagnostics.
-10. Built-in workload shapes are strict.
-11. Extension workload fields remain application-owned.
+10. The routed workload envelope is strict.
+11. Routed workload fields remain application-owned.
 12. Embedded remains valid in the model and absent from runner capabilities.
 13. Filters run before pagination.
 14. Continuations remain bound to one filter and snapshot version.

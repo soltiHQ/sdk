@@ -51,7 +51,7 @@ The umbrella crate only forwards features and namespaces.
 
 ## Check the fit first
 
-Use Solti when a binary needs versioned Task resources, pluggable workload kinds, desired-state reconciliation, or a public agent API.
+Use Solti when a binary needs versioned Task resources, declared workload types, desired-state reconciliation, or a public agent API.
 
 If the process only needs to supervise ordinary async functions, use [Taskvisor](https://github.com/soltiHQ/taskvisor) directly.
 It has a smaller API and no resource or network layer.
@@ -78,11 +78,8 @@ use std::{env, io, time::Duration};
 
 use solti::{
     core::SupervisorApi,
-    exec::subprocess::register_subprocess_runner,
-    model::{
-        Flag, RestartPolicy, SubprocessMode, SubprocessSpec, TaskEnv, TaskManifest, TaskSpec,
-        TaskWorkload,
-    },
+    exec::subprocess::{SubprocessMode, SubprocessSpec, register_subprocess_runner},
+    model::{Flag, RestartPolicy, TaskEnv, TaskManifest, TaskSpec, TaskWorkload},
     runner::RunnerRouter,
 };
 
@@ -100,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let supervisor = SupervisorApi::builder(router).start().await?;
 
     let command = env::current_exe()?.to_string_lossy().into_owned();
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command {
             command,
             args: vec![CHILD_MODE.into()],
@@ -108,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("quick-start", workload, 30_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;
@@ -216,11 +213,23 @@ A `Task` has `apiVersion`, `kind`, `metadata`, `spec`, and `status`.
 The caller owns desired fields.
 Core owns UID, resource version, generation, timestamps, status, and conditions.
 
-Built-in workload kinds are `Subprocess`, `Container`, `Wasm`, and `Embedded`.
-`Wasm` is a model contract; this repository does not provide a built-in WASM runner.
+A workload is a routed `{apiVersion, kind, spec}` envelope, or `Embedded`.
+Each runner declares the workload types it runs: a GVK, the JSON Schema of the `spec`, and a check of the body.
+The agent advertises the schemas' fingerprints to the control plane and sends the schemas on request, so Podium validates a spec before it deploys it.
 
-Application-owned workload kinds use `ExtensionWorkload` with a non-`solti.io` GVK and strict runner-side decoding.
-Runner routing uses workload GVK and an optional Kubernetes-style label selector.
+| GVK | Provided by | Body |
+|---|---|---|
+| `exec.solti.io/v1` `Subprocess` | `solti-exec` | Command or script, environment, working directory |
+| `exec.solti.io/v1` `Container` | `solti-exec` | Image, command, arguments, environment |
+| `chain.solti.io/v1alpha1` `Chain` | `solti-chain` | Entry step and steps with their nested workloads |
+| `solti.io/v1` `Embedded` | `solti-model` | In-process implementation revision; never routed |
+
+Application-owned types use any other group; the `solti.io` group is reserved.
+Routing is first-match: the first runner, in registration order, whose exact GVK and labels match.
+Podium evaluates that runner, and there is no schema-aware routing.
+Core runs that runner's check at admission, before a write commits.
+There is no WASM type; an application that embeds an engine declares its own.
+See [routing and custom runners](docs/routing-and-custom-runners.md) and, for an upgrade, [migrating from 0.0.8 to 0.0.9](docs/migrating-from-0-0.md).
 
 `Embedded` carries an in-process `TaskRef` supplied by the binary.
 It bypasses runner routing and has no HTTP or gRPC representation.
@@ -231,7 +240,7 @@ The optional `solti-chain` runner represents a Chain as one ordinary Task.
 Its steps are nested workloads, and exactly one step is active at a time.
 Each successful or failed step may select one next step.
 
-Chain uses a regular extension workload under `Task.spec.workload`.
+Chain is a declared workload type under `Task.spec.workload`.
 Existing HTTP and gRPC Task operations carry it without a new resource API.
 
 The outer Task owns timeout, restart, backoff, admission, cancellation, status, history, and output.
@@ -511,7 +520,7 @@ Names identify the boundary:
 | [task_cron.rs](crates/solti/examples/task_cron.rs)                       | `cron,core`                   | Calendar invocations, explicit cancellation, and shutdown |
 | [task_chain.rs](crates/solti/examples/task_chain.rs)                     | `chain,core,exec-subprocess`   | Conditional steps with failure recovery               |
 | [task_subprocess.rs](crates/solti/examples/task_subprocess.rs)           | `core,exec-subprocess`         | Output, reconciliation, terminal status, and history  |
-| [task_custom_workload.rs](crates/solti/examples/task_custom_workload.rs) | `core`                         | Application-owned `TcpProbe` GVK and runner           |
+| [task_custom_workload.rs](crates/solti/examples/task_custom_workload.rs) | `core,model-schema`            | Declared application-owned `TcpProbe` type and runner |
 | [task_containerd.rs](crates/solti/examples/task_containerd.rs)           | `core,exec-containerd`         | Native containerd 2.x attempt; Linux runtime required |
 
 ### Agent boundaries

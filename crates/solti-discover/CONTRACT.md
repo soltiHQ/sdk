@@ -46,9 +46,13 @@ Taskvisor starts an attempt
             ├── first attempt ──► startup jitter below delay_ms
             ├── wait for any remaining server hold
             ├── stamp ts and uptime_seconds
-            └── send SyncRequest
-                       ├── success ──► Ok
-                       │               └── delay_ms ──► next attempt
+            └── send the heartbeat SyncRequest, never with a schema
+                       ├── success ──► requested schemas left to send?
+                       │                 ├── yes ──► follow-up SyncRequest, at most 6 per attempt
+                       │                 │             ├── success ──► ask again
+                       │                 │             └── failure ──► WARN, Ok
+                       │                 └── no ──► Ok
+                       │                             └── delay_ms ──► next attempt
                        ├── retryable failure ──► TaskError::Fail
                        │                            └── Taskvisor backoff
                        └── permanent failure ──► TaskError::Fatal ──► stop
@@ -64,17 +68,24 @@ Retryable failures use the configured Taskvisor backoff.
 
 Every sleep and transport request observes task cancellation.
 
+The heartbeat decides the outcome of the attempt.
+It never carries a schema, so schema delivery can never fail it: a schema
+request refused for its size, or too slow for the link, fails only its
+follow-up.
+Follow-ups exist only for the [schema exchange](#schema-exchange).
+
 ## Request construction
 
 `sync` captures `DiscoverConfig` when it constructs the task.
 It builds one base request from that snapshot.
 
-Every attempt clones the base request.
-Only `ts` and `uptime_seconds` are refreshed.
-Both values are converted to the signed 64-bit discovery v1 wire fields with
-checked conversions. An out-of-range uptime is `InvalidConfig`, does not reach
-the transport, does not record transport attempt or failure metrics, and
-terminates the task attempt as `TaskError::Fatal`.
+Every request, heartbeat or follow-up, clones the base request.
+Only `ts`, `uptime_seconds` and, in a follow-up, `schemas` change.
+`ts` and `uptime_seconds` are converted to the signed 64-bit discovery v1 wire
+fields with checked conversions. For the heartbeat, an out-of-range uptime is
+`InvalidConfig`, does not reach the transport, does not record transport
+attempt or failure metrics, and terminates the task attempt as
+`TaskError::Fatal`. For a follow-up, it ends the attempt as a failed follow-up.
 
 Apply a new embedded task when captured discovery settings change.
 Use a new `task_revision` for the changed runtime intent.
@@ -101,13 +112,15 @@ The request contract is defined in
 | `api_version`          | `int32`              | Version of the API exposed by the agent            |
 | `heartbeat_interval_s` | `int32`              | `ceil(delay_ms / 1000)`                            |
 | `capabilities`         | `AgentCapabilities`  | Captured runner capability snapshot                |
+| `schemas`              | `repeated WorkloadSchema` | Follow-ups only: requested schemas that fit the request budget; always empty in a heartbeat |
 
 The caller owns `AgentId` assignment and uniqueness.
 The SDK validates its format.
 
-Discovery v1 does not define an aggregate request byte ceiling, and the SDK
-does not enforce one before transport. The 128 KiB limit in the `http_sync`
-example belongs to that example server and is not an SDK protocol policy.
+Podium caps one encoded request at 256 KiB, the HTTP body or the gRPC message.
+The SDK keeps every request within a budget below that cap.
+`sync` refuses a capability snapshot whose heartbeat is over the budget;
+see [Schema exchange](#schema-exchange).
 
 `AgentEndpoint` accepts `api_version` values from `1` through `i32::MAX`.
 
@@ -147,8 +160,13 @@ Each `RunnerCapability` contains:
 Runner names must be unique inside one capability snapshot.
 Workload GVKs use canonical order inside each runner.
 
-Each `WorkloadType` contains `api_version` and `kind`.
-Routing matches both values exactly.
+Each `WorkloadType` contains `api_version`, `kind` and `schema_fingerprint`.
+Routing matches `api_version` and `kind` exactly.
+`schema_fingerprint` is the lowercase hex SHA-256 of the RFC 8785 canonical
+JSON of the type's schema: 64 characters, never empty.
+Two types with the same schema share one fingerprint.
+A GVK declared by two runners appears under each of them, with each runner's
+own fingerprint; the first runner that matches routes the task.
 
 `Embedded` cannot be declared by a runner capability.
 Embedded workloads bypass runner routing.
@@ -159,14 +177,16 @@ An empty `runners` list means that the agent advertises no routable runner.
 
 The response contract is:
 
-| Field           | Protobuf type | Client behavior                                      |
-|-----------------|---------------|------------------------------------------------------|
-| `success`       | `bool`        | Accepts the sync when `true`                         |
-| `reason`        | `string`      | Untrusted diagnostic text used when rejected         |
-| `retry_after_s` | `int32`       | Server hold used only when rejected                  |
+| Field           | Protobuf type     | Client behavior                                  |
+|-----------------|-------------------|--------------------------------------------------|
+| `success`       | `bool`            | Accepts the sync when `true`                     |
+| `reason`        | `string`          | Untrusted diagnostic text used when rejected     |
+| `retry_after_s` | `int32`           | Server hold used only when rejected              |
+| `want_schemas`  | `repeated string` | Fingerprints of the schemas to send, when accepted |
 
-`success = true` completes the attempt.
+`success = true` accepts the request.
 The client ignores `reason` and `retry_after_s` in that response.
+It reads `want_schemas` for the [schema exchange](#schema-exchange).
 
 `success = false` creates `DiscoverError::Rejected`.
 This error is retryable.
@@ -192,6 +212,117 @@ success = false with retry_after_s > 0
 Taskvisor backoff and server hold are not added together.
 The next request starts only after both constraints have elapsed.
 
+## Schema exchange
+
+Each heartbeat advertises the schema fingerprint of every declared workload
+type, and never carries a schema itself. Only follow-ups carry schemas, and a
+follow-up carries one only when the control plane asked for its fingerprint in
+`want_schemas`, and only for a fingerprint the same request declares.
+
+| Constant                      | Value       | Meaning                                         |
+|-------------------------------|-------------|-------------------------------------------------|
+| `MAX_SYNC_REQUEST_BYTES`      | 262 144     | Podium's cap on one encoded request             |
+| `SYNC_REQUEST_HEADROOM_BYTES` | 1 024       | Bytes kept free below that cap                  |
+| Request budget                | 261 120     | The cap minus the headroom                      |
+| `MAX_SCHEMA_FOLLOW_UPS`       | 6           | Follow-up requests per attempt, after the heartbeat |
+| `SCHEMA_RESEND_INTERVAL`      | 300 seconds | Least time between two sends of one schema that stays requested |
+
+These constants are crate-private.
+
+### Requested schemas
+
+The `want_schemas` of each accepted response replaces the set of requested
+schemas. Only fingerprints the agent declares count. Any other entry is logged
+at DEBUG and ignored.
+
+The agent records a send when an accepted request carries a schema. It forgets
+that record, and any `discovery.schema_still_requested` report of the schema,
+when an accepted response does not request the schema: the control plane
+stored it or refused it. A requested schema is *due* when it has no record, or
+its record is at least 300 seconds old. It is *sendable* when it is due and the
+current attempt has not sent it. An attempt sends each schema at most once.
+
+So a schema goes out at once when it was never sent, and when the control plane
+requests it again after a response stopped requesting it: the control plane
+lost it, as when Podium restarts with its memory backend, a fresh raft cluster
+or a restored database. Only a schema that the response to the request that
+carried it still requests, and every response since, waits 300 seconds between
+sends. A schema that the control plane refuses is sent once more each time a
+restarted control plane requests it again, and refused again.
+
+The heartbeat's response restates `want_schemas`, so keeping the heartbeat
+bare adds no round trip: the follow-ups start right after it.
+
+### Packing a follow-up
+
+Every follow-up carries sendable schemas:
+
+- in sorted fingerprint order, the order of `want_schemas`;
+- as `WorkloadSchema { fingerprint, schema }`, where `schema` is exactly the
+  canonical JSON whose SHA-256 is `fingerprint`;
+- while the encoded request stays within the request budget. The first schema
+  that does not fit ends the packing and goes in a later follow-up.
+
+The size is measured with the encoder of the transport in use:
+
+| Transport | Encoded size                                                          |
+|-----------|-----------------------------------------------------------------------|
+| gRPC      | `prost::Message::encoded_len` of the request                          |
+| HTTP      | Length of the JSON body, `serde_json::to_vec`; bytes are standard base64 |
+
+A follow-up therefore carries about three 64 KiB schemas over gRPC and about
+two over HTTP. When the heartbeat learns that five schemas of exactly 65 536
+bytes are requested, they go out in two follow-ups over gRPC (three, then two)
+and in three over HTTP (two, two, then one).
+
+A follow-up is the heartbeat's request plus its schemas, so a schema that
+cannot fit beside the bare heartbeat can never be sent. `sync` logs
+`discovery.schema_over_request_budget` at WARN for each such schema, and
+packing skips it, so that it holds back no other schema.
+
+`sync` returns `DiscoverError::InvalidConfig` when the heartbeat encodes over
+the request budget. It measures that heartbeat with the largest `ts` and
+`uptime_seconds` the wire carries, so no later heartbeat is larger.
+
+### Follow-ups
+
+After the accepted heartbeat, and after each accepted follow-up, the attempt
+sends a follow-up at once while a requested schema is sendable, up to six
+follow-ups. A follow-up in which no sendable schema fits is not sent. Each
+follow-up gets a fresh `ts` and `uptime_seconds`, and records the same metrics
+as the heartbeat.
+
+A failed follow-up is logged at WARN as `discovery.schema_follow_up_failed`,
+and the attempt returns `Ok`, because the heartbeat already succeeded. That
+holds for every failure, a permanent one such as HTTP 413 included. The
+schemas it carried are still due, so the next attempt's follow-ups send them
+again, after its bare heartbeat. A rejection with `retry_after_s` still sets
+the server hold.
+
+### What the agent can and cannot see
+
+| Situation                                                           | Agent behavior |
+|---------------------------------------------------------------------|----------------|
+| The response to a follow-up still asks for a schema that follow-up carried | WARN `discovery.schema_still_requested`, with its workload types and size, once per fingerprint for the task until a response stops requesting it; the schema is resent at most every 300 seconds while it stays requested |
+| A response asks again for a schema that an earlier response stopped requesting | The schema is due at once, and the next follow-up carries it; INFO `discovery.schemas_sent` records the send |
+| The response asks for a fingerprint the agent does not declare      | DEBUG `discovery.schema_unknown_request`; ignored |
+| The control plane refuses a schema                                  | Podium stops asking for it, which the agent cannot tell apart from success. Podium's catalog shows it as `refused`, and placement shows `schema_incompatible` with the reason |
+
+A schema still requested right after it was sent means a store error or a
+fingerprint mismatch on the control plane's side. A schema requested again
+after a response stopped requesting it means the control plane lost it.
+
+### Logs
+
+| Event                                  | Level | When |
+|----------------------------------------|-------|------|
+| `discovery.workload_types`             | INFO  | Once per task, from `sync`: each `apiVersion/kind` with its schema fingerprint |
+| `discovery.schemas_sent`               | INFO  | After each accepted follow-up: the fingerprints and the encoded request size |
+| `discovery.schema_still_requested`     | WARN  | See the table above |
+| `discovery.schema_unknown_request`     | DEBUG | See the table above |
+| `discovery.schema_follow_up_failed`    | WARN  | A follow-up failed; the attempt still succeeds |
+| `discovery.schema_over_request_budget` | WARN  | From `sync`, for each schema that cannot fit in a follow-up even alone |
+
 ## HTTP binding
 
 The HTTP binding requires the `http` feature.
@@ -210,6 +341,7 @@ An existing base path is preserved.
 The JSON encoding follows protobuf JSON conventions.
 Field names use lower camel case.
 The `int64` values `ts` and `uptimeSeconds` are encoded as decimal strings.
+The `bytes` value `schemas[].schema` is encoded as standard base64.
 `endpointType` is encoded as its symbolic protobuf name.
 Fields containing protobuf default values are omitted.
 
@@ -285,8 +417,10 @@ Connection failures are retryable.
 
 Configuration and task construction failures are returned by `sync`.
 They occur before the embedded task is available.
+A capability snapshot whose heartbeat is over the request budget is one of them.
 
-Runtime discovery failures are converted into Taskvisor errors.
+Runtime discovery failures of the heartbeat are converted into Taskvisor errors.
+A failed follow-up is logged and not returned; see [Follow-ups](#follow-ups).
 
 HTTP client construction can also return `HttpRequest` from `sync`.
 No automatic retry exists before a task has been returned.
@@ -335,10 +469,11 @@ The attempt timeout is built from:
 ```text
 delay_ms
 + 3_600_000 ms maximum server hold
-+ connect_timeout_ms
-+ request_timeout_ms
++ (1 + MAX_SCHEMA_FOLLOW_UPS) × (connect_timeout_ms + request_timeout_ms)
 + 1_000 ms overhead
 ```
+
+`1 + MAX_SCHEMA_FOLLOW_UPS` is 7: the heartbeat and up to six follow-ups.
 
 The additions saturate at `u64::MAX`.
 Taskvisor retries an attempt timeout through the configured failure backoff.

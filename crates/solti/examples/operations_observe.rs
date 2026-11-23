@@ -25,11 +25,8 @@ use std::{env, io, time::Duration};
 
 use solti::{
     core::{SupervisorApi, TaskWatchSubscription},
-    exec::subprocess::register_subprocess_runner,
-    model::{
-        Flag, RestartPolicy, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskId, TaskManifest,
-        TaskSpec, TaskWorkload,
-    },
+    exec::subprocess::{SubprocessMode, SubprocessSpec, register_subprocess_runner},
+    model::{Flag, RestartPolicy, Task, TaskEnv, TaskId, TaskManifest, TaskSpec, TaskWorkload},
     observe::{
         LoggerConfig, LoggerFormat, LoggerLevel, LoggerTimeZone, init_logger, timezone_sync,
     },
@@ -94,7 +91,7 @@ solti: logging and supervised maintenance
     );
 
     let mut watch = supervisor.watch_tasks(&Default::default(), None)?;
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command {
             command: current_executable()?,
             args: vec![CHILD_MODE.into()],
@@ -102,7 +99,7 @@ solti: logging and supervised maintenance
         TaskEnv::new(),
         None,
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("observable-example", workload, 30_000_u64)
         .restart(RestartPolicy::Never)
         .build()?;

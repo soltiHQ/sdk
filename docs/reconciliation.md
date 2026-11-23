@@ -44,7 +44,7 @@ This is not a staged rollout or an availability guarantee. It does not keep two 
 
 ## Routed construction
 
-The router selects by exact workload group/version and kind, then applies `runnerSelector` to registered runner labels. The first matching registration wins. No match is a routing failure. Embedded resources bypass routing and use the supplied task object.
+The router selects by exact workload group/version and kind, then applies `runnerSelector` to registered runner labels. The first matching registration wins, and admission already ran that runner's declared check on the body before the write committed. No match is a routing failure. Embedded resources bypass routing and use the supplied task object.
 
 For a routed resource, core performs the build before cancelling a previous accepted runtime. If selection or construction fails at this stage, the new generation records `Reconciled=False`; the build-failure branch has not yet requested removal of that previous runtime. The stored desired state is still the new generation.
 

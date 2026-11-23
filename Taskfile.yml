@@ -9,6 +9,8 @@ includes:
     taskfile: https://raw.githubusercontent.com/soltiHQ/actions/v1/taskfiles/helpers/Taskfile.yml
 
 vars:
+  proto_repo: https://github.com/soltiHQ/proto.git
+  proto_ref: v0.2.0
   docs_version:
     sh: sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' Cargo.toml | head -n 1
   publish_crates:
@@ -26,7 +28,8 @@ tasks:
     cmds:
       - task: helpers:proto/vendor
         vars:
-          proto_ref: "v0.1.0"
+          proto_repo: '{{.proto_repo}}'
+          proto_ref: '{{.proto_ref}}'
           MAPPINGS: |
             solti/task crates/solti-api/proto/solti/task
             solti/agent crates/solti-discover/proto/solti/agent
@@ -72,6 +75,25 @@ tasks:
         vars: { TEST_ARGS: '--workspace --all-features --locked' }
       - task: rust:test
         vars: { TEST_ARGS: '--workspace --no-default-features --locked' }
+
+  test/crate:
+    desc: "Development check: cargo test for one package."
+    deps: [proto/vendor]
+    requires:
+      vars: [ CRATE ]
+    vars:
+      FEATURE: '{{.FEATURE | default "all"}}'
+      ARGS: '{{.ARGS | default ""}}'
+      FEATURE_FLAGS:
+        sh: |
+          case "{{.FEATURE}}" in
+            none) echo '--no-default-features' ;;
+            all)  echo '--all-features' ;;
+            *)    echo "--no-default-features --features {{.FEATURE}}" ;;
+          esac
+    cmds:
+      - task: rust:test
+        vars: { TEST_ARGS: '-p {{.CRATE}} {{.FEATURE_FLAGS}} --locked {{.ARGS}}' }
 
   ci/test/unit:
     desc: Run unit tests and doctests in both workspace feature configurations.

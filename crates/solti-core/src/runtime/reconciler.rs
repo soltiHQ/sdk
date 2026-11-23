@@ -523,6 +523,14 @@ pub(crate) struct Reconciler {
 }
 
 impl Reconciler {
+    /// Checks a routed spec with the runner routing would pick for it.
+    pub(crate) fn validate_workload(
+        &self,
+        spec: &solti_model::TaskSpec,
+    ) -> Result<(), solti_runner::RouterError> {
+        self.router.validate(spec)
+    }
+
     pub(crate) fn new(
         output_hub: Arc<OutputHub>,
         handle: SupervisorHandle,
@@ -590,6 +598,17 @@ impl Reconciler {
         name: TaskId,
     ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         self.arm_intake_panic(name, InjectedIntakePanicStage::AfterProvisionalBind)
+    }
+
+    /// Whether the active reconciliation of `name` carries a `cancel_task` request.
+    #[cfg(test)]
+    pub(crate) fn has_user_cancellation(&self, name: &TaskId) -> bool {
+        let slots = self.reconciliation_queue.slots.lock();
+        slots.get(name).is_some_and(|slot| {
+            slot.active_cancellation
+                .as_ref()
+                .is_some_and(ReconciliationCancellation::is_user_requested)
+        })
     }
 
     #[cfg(test)]

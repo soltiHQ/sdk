@@ -21,7 +21,7 @@ Agent discovery task ── heartbeat ──► ControlPlaneEndpoint
 | `AgentEndpoint` | The application supplies the API address, transport, and Task API version advertised to the control plane. |
 | `ControlPlaneEndpoint` | The application supplies the outbound discovery address and discovery transport. |
 | `AgentId` | The application assigns a stable identity and owns its uniqueness. The model validates its format. |
-| `AgentCapabilities` | The runner router describes the routed workloads this agent exposes. |
+| `AgentCapabilities` | The runner router describes the routed workload types this agent exposes, each with the fingerprint of its schema. |
 | `DiscoverConfig` | `solti-discover` captures endpoint, identity, metadata, timing, credentials, and metrics settings. |
 | Embedded task | `solti-core` commits its desired state; Taskvisor runs, retries, and cancels its attempts. |
 
@@ -104,7 +104,7 @@ Use another `UptimeSource` when the application owns a different epoch.
 
 `runner_capabilities()` returns the router's immutable snapshot.
 Runner order preserves registration order and routing priority.
-Each entry contains its name, static labels, and exact workload API-version/kind pairs.
+Each entry contains its name, static labels, and its workload types: exact API-version/kind pairs, each with its schema fingerprint.
 Embedded tasks are not runner capabilities because they bypass routing.
 An agent without routed runners explicitly advertises an empty capability set.
 
@@ -145,8 +145,9 @@ first attempt only: startup jitter below delay_ms
           ▼
 wait for any remaining server hold
           ▼
-stamp current time and uptime ──► send request
-          ├── accepted ──► success ──► periodic delay_ms
+stamp current time and uptime ──► send the heartbeat, never with a schema
+          ├── accepted ──► follow-ups for requested schemas (at most 6)
+          │                 └── any outcome ──► success ──► periodic delay_ms
           ├── retryable failure ──► TaskError::Fail ──► failure backoff
           └── permanent failure ──► TaskError::Fatal ──► stop
 ```
@@ -155,7 +156,7 @@ The startup jitter applies once per constructed task, not once per retry.
 The success interval is a delay after an attempt finishes, not a wall-clock schedule.
 Sleeps and transport awaits observe task cancellation.
 
-The attempt timeout includes one interval, the maximum one-hour server hold, connect timeout, request timeout, and one second of overhead.
+The attempt timeout includes one interval, the maximum one-hour server hold, the connect and request timeouts of the heartbeat and of each of up to six schema follow-ups, and one second of overhead.
 It is separate from the transport's request timeout.
 
 A response with `success=true` accepts the sync and ignores any reason or retry hold in that response.
@@ -165,6 +166,46 @@ Its reason is diagnostic text, not a machine-readable failure class.
 A positive `retry_after_s` sets a monotonic hold deadline, capped at 3600 seconds.
 Backoff still follows the failed attempt. The next request waits for the remainder of the hold if necessary.
 Backoff and hold are overlapping constraints, not two delays added together.
+
+## Exchange workload schemas
+
+The heartbeat names each workload type's schema by fingerprint and never carries a schema.
+A fingerprint is the lowercase hex SHA-256 of the schema's RFC 8785 canonical JSON, and the canonical bytes are exactly what the agent sends.
+Podium answers an accepted heartbeat with `want_schemas`, the fingerprints it lacks, and the task sends those in follow-up requests of the same attempt.
+
+| Rule | Value |
+|---|---|
+| Request cap | 256 KiB encoded, minus 1 KiB of headroom |
+| Follow-ups per attempt | At most 6; each schema once per attempt |
+| One follow-up over HTTP | About two 64 KiB schemas: the JSON body carries schema bytes as base64 |
+| One follow-up over gRPC | About three 64 KiB schemas: protobuf carries raw bytes |
+| Resend of a schema Podium still requests right after it was sent | At most every 5 minutes |
+| A schema Podium requests again after it stopped requesting it | Sent in the next follow-up, without waiting |
+
+The size is measured with the encoder of the transport in use.
+Five requested schemas of 64 KiB therefore go out in two follow-ups over gRPC and three over HTTP.
+
+A failed follow-up never fails the attempt.
+It is logged at WARN as `discovery.schema_follow_up_failed`, the attempt still succeeds, the heartbeat's liveness stands, and the next attempt sends what Podium still wants.
+That holds for a refusal too, an HTTP 413 included.
+A schema too large to fit beside a bare heartbeat can never be sent: `sync` logs `discovery.schema_over_request_budget` at WARN for it and the others still go out.
+A capability set whose bare heartbeat is over budget is refused by `sync` with `DiscoverError::InvalidConfig`.
+
+A fingerprint that Podium keeps requesting right after the follow-up that carried it is logged at WARN as `discovery.schema_still_requested`, once per fingerprint in each discovery task until a response stops requesting it.
+The schema is resent at most every 5 minutes while Podium keeps requesting it.
+Still being requested means that Podium's store failed or that its hash of the bytes differs; it is not a refusal.
+
+When a response stops requesting a schema, Podium stored it, or refused it, and the agent forgets when it sent it.
+If a later response requests it again, Podium lost it, as after a restart with the memory backend, a fresh raft cluster or a restored database: the agent sends it in the next follow-up, without waiting the 5 minutes.
+A refused schema is therefore sent once more each time a restarted Podium requests it, and refused again.
+
+Podium's refusal of a schema is silent to the agent.
+Podium stops requesting a schema it cannot compile, and the agent cannot tell that from success.
+Look in Podium's workload catalog, where the fingerprint shows as `refused` with the reason, and in the placement detail of a spec bound to it, which reports `schema_incompatible`.
+
+Podium re-checks a target's compatibility before every push, so a schema that stops accepting a deployed body fails the rollout instead of pushing it.
+
+The [discovery contract](../crates/solti-discover/CONTRACT.md#schema-exchange) lists the log events and the exact packing rules.
 
 ## Handle transport and response failures
 
@@ -182,7 +223,7 @@ Redirects are disabled. One HTTP client is reused across attempts.
 The discovery HTTP body follows the documented protobuf JSON encoding, unlike the Task API's CRD JSON.
 Use the [discovery contract](../crates/solti-discover/CONTRACT.md#http-binding) for exact field encodings.
 Successful response bodies are limited to 64 KiB. Non-success responses retain at most a 1 KiB diagnostic body preview.
-The protocol does not define an aggregate discovery request-byte ceiling.
+Podium caps one encoded request at 256 KiB, and the SDK keeps every request within that cap minus 1 KiB of headroom; see [Exchange workload schemas](#exchange-workload-schemas).
 
 | Failure | Behavior |
 |---------|----------|

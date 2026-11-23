@@ -14,9 +14,9 @@ A subprocess, an OCI container, and an in-process runner have different isolatio
 
 | Component | Role and reason to use it |
 |---|---|
-| `solti-model` | Defines `ContainerSpec` and the outer Task policy without choosing a daemon. |
-| `solti-runner` | Routes `solti.io/v1/Container` to a registered backend and carries build context. |
-| `solti-exec/container` | Supplies `ContainerRunner`, engine interfaces, ownership bindings, output handling, and `ContainerProcessPolicy`. It does not select an engine. |
+| `solti-model` | Defines the routed workload envelope and the outer Task policy without choosing a daemon. |
+| `solti-runner` | Routes `exec.solti.io/v1/Container` to the first matching registered backend and carries build context. |
+| `solti-exec/container` | Defines `ContainerSpec`, declares the `Container` type with its schema, and supplies `ContainerRunner`, engine interfaces, ownership bindings, output handling, and `ContainerProcessPolicy`. It does not select an engine. |
 | `solti-exec/containerd` | Adds the native containerd 2.x adapter and enables `container`. Actual attempts require Linux. |
 | `solti-exec/host-process` | Supplies host-process controls for subprocesses and custom process backends. It is not the OCI policy renderer. |
 | `solti-core` and Taskvisor | Own desired state, runtime admission, attempt timeout/restart, cancellation, and observable lifecycle. They do not own an external container daemon. |
@@ -26,7 +26,7 @@ The facade uses `exec-container` for engine-neutral integration and `exec-contai
 Host seccomp uses the `seccomp` feature, which enables `host-process`.
 For the subprocess backend, select both `subprocess` and `seccomp`; a custom host-process backend does not need `subprocess`.
 Native OCI seccomp is rendered by `containerd` without that host-process feature.
-`WasmSpec` is model-only. No bundled WASM engine or in-process WASM isolation is enabled by these features.
+The SDK has no `Wasm` workload type and no bundled WASM engine or in-process WASM isolation. An application that embeds an engine declares its own type, and host process controls do not isolate it.
 
 ## Build once, create resources per attempt
 
@@ -307,7 +307,7 @@ They do not install containerd, start a daemon, or provision host networking.
 ## See also
 
 - [Subprocesses](subprocesses.md): command/script transport, descriptor boundaries, and finalizer ownership.
-- [Routing and custom runners](routing-and-custom-runners.md): registration, build budgets, and extension contracts.
+- [Routing and custom runners](routing-and-custom-runners.md): registration, workload declarations, build budgets, and routing.
 - [Build an agent](building-an-agent.md): retain service and backend shutdown handles.
 - [Example catalog](example-catalog.md): runnable paths and prerequisites.
 - Source: [engine contracts](../crates/solti-exec/src/container/engine.rs), [container lifecycle](../crates/solti-exec/src/container/runner.rs), [container policy](../crates/solti-exec/src/container/policy.rs), [native configuration](../crates/solti-exec/src/container/containerd/config.rs), [OCI construction](../crates/solti-exec/src/container/containerd/spec.rs), [host policy](../crates/solti-exec/src/host/policy.rs), and [Linux security](../crates/solti-exec/src/host/security.rs).

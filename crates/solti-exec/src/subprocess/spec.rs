@@ -1,13 +1,24 @@
 //! # Subprocess workload
 //!
 //! [`SubprocessMode`] selects a command or an interpreter-backed script.
-//! [`SubprocessSpec`](super::SubprocessSpec) adds environment, working directory, and exit-code policy.
+//! [`SubprocessSpec`] adds environment, working directory, and exit-code policy.
+//! It is the body of the `exec.solti.io/v1` `Subprocess` workload.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ModelError, ModelResult};
+use std::path::{Path, PathBuf};
+
+use solti_model::{Flag, ModelError, ModelResult, TaskEnv, WorkloadBody};
+
+use crate::EXEC_API_VERSION;
+use crate::registration::at_field as at;
+use crate::subprocess::backend::validate_env_name;
+use crate::subprocess::task::{reject_nul, validate_env_value};
+
+/// Kind of the subprocess workload under [`EXEC_API_VERSION`].
+pub const SUBPROCESS_KIND: &str = "Subprocess";
 
 /// Maximum decoded script body size.
 pub const MAX_SCRIPT_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -63,7 +74,7 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 /// ```
 /// use base64::Engine;
 /// use base64::engine::general_purpose::STANDARD as BASE64;
-/// use solti_model::SubprocessMode;
+/// use solti_exec::subprocess::SubprocessMode;
 ///
 /// let mode = SubprocessMode::Script {
 ///     interpreter: "bash".into(),
@@ -73,18 +84,17 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 ///
 /// assert_eq!(mode.decode_body().unwrap(), "echo hello");
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(
+    description = "Execution strategy for a subprocess task: command runs an executable with arguments; script runs a base64 body through an interpreter with arguments."
+)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SubprocessMode {
     /// Direct binary execution.
     Command {
         /// Executable name or path.
-        #[cfg_attr(
-            feature = "schema",
-            schemars(schema_with = "crate::schema::non_empty_string")
-        )]
+        #[schemars(schema_with = "crate::schema::non_empty_string")]
         command: String,
         /// Command-line arguments.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -93,16 +103,10 @@ pub enum SubprocessMode {
     /// Script execution via an explicit interpreter.
     Script {
         /// Interpreter executable name or path.
-        #[cfg_attr(
-            feature = "schema",
-            schemars(schema_with = "crate::schema::non_empty_string")
-        )]
+        #[schemars(schema_with = "crate::schema::non_empty_string")]
         interpreter: String,
         /// Standard padded base64 script body.
-        #[cfg_attr(
-            feature = "schema",
-            schemars(schema_with = "crate::schema::script_body")
-        )]
+        #[schemars(schema_with = "crate::schema::script_body")]
         body: String,
         /// Additional arguments passed after the script body.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -124,7 +128,7 @@ impl SubprocessMode {
     /// ```
     /// use base64::Engine;
     /// use base64::engine::general_purpose::STANDARD as BASE64;
-    /// use solti_model::SubprocessMode;
+    /// use solti_exec::subprocess::SubprocessMode;
     ///
     /// let mode = SubprocessMode::Script {
     ///     interpreter: "bash".into(),
@@ -151,7 +155,7 @@ impl SubprocessMode {
     /// ```
     /// use base64::Engine;
     /// use base64::engine::general_purpose::STANDARD as BASE64;
-    /// use solti_model::SubprocessMode;
+    /// use solti_exec::subprocess::SubprocessMode;
     ///
     /// let mode = SubprocessMode::Script {
     ///     interpreter: "bash".into(),
@@ -184,7 +188,7 @@ impl SubprocessMode {
     /// ## Example
     ///
     /// ```
-    /// use solti_model::SubprocessMode;
+    /// use solti_exec::subprocess::SubprocessMode;
     ///
     /// let mode = SubprocessMode::Command {
     ///     command: "echo".into(),
@@ -218,6 +222,137 @@ impl SubprocessMode {
         }
         Ok(())
     }
+}
+
+/// Specification for subprocess execution on the host.
+///
+/// Supports two execution strategies via [`SubprocessMode`]:
+/// - command: direct binary execution;
+/// - script: script body passed to an explicit interpreter.
+///
+/// Common fields (`env`, `cwd`, `fail_on_non_zero`) apply to both modes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(
+    description = "Specification for subprocess execution on the host, in command or script mode. env, cwd and failOnNonZero apply to both modes."
+)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[non_exhaustive]
+pub struct SubprocessSpec {
+    /// Execution strategy (command or script).
+    pub mode: SubprocessMode,
+    /// Environment variables for the process.
+    #[serde(default, skip_serializing_if = "TaskEnv::is_empty")]
+    pub env: TaskEnv,
+    /// Working directory.
+    ///
+    /// A validated task spec requires this wire-facing path to be valid UTF-8.
+    #[schemars(description = "Working directory.")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// Whether to treat non-zero exit codes as task failure.
+    ///
+    /// When enabled (default), any non-zero exit code will be reported as a failure.
+    #[serde(default)]
+    pub fail_on_non_zero: Flag,
+}
+
+impl SubprocessSpec {
+    /// Creates a subprocess spec.
+    ///
+    /// `SubprocessSpec` is `#[non_exhaustive]`.
+    /// Use this constructor outside the crate.
+    /// Validation occurs when the runner decodes the workload body.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use solti_exec::subprocess::{SubprocessMode, SubprocessSpec};
+    /// use solti_model::{Flag, TaskEnv};
+    ///
+    /// let spec = SubprocessSpec::new(
+    ///     SubprocessMode::Command {
+    ///         command: "echo".into(),
+    ///         args: vec!["hello".into()],
+    ///     },
+    ///     TaskEnv::default(),
+    ///     None,
+    ///     Flag::enabled(),
+    /// );
+    ///
+    /// assert!(spec.fail_on_non_zero.is_enabled());
+    /// ```
+    pub fn new(
+        mode: SubprocessMode,
+        env: TaskEnv,
+        cwd: Option<PathBuf>,
+        fail_on_non_zero: Flag,
+    ) -> Self {
+        Self {
+            mode,
+            env,
+            cwd,
+            fail_on_non_zero,
+        }
+    }
+}
+
+impl WorkloadBody for SubprocessSpec {
+    const API_VERSION: &'static str = EXEC_API_VERSION;
+    const KIND: &'static str = SUBPROCESS_KIND;
+
+    /// Validates the subprocess mode, the wire-facing cwd, and what the runner hands to the
+    /// operating system.
+    ///
+    /// The mode must be valid. `cwd` must be valid UTF-8, since it travels as JSON text.
+    /// The command or interpreter, the arguments, `cwd` and the environment values must hold
+    /// no NUL byte, and each environment name must be non-empty and hold no `=` or NUL: the
+    /// rules the runner applies when it builds the task, so admission refuses what the build
+    /// would. These refusals name the field, as `spec.env[0].key: …`.
+    fn validate(&self) -> Result<(), String> {
+        self.mode.validate().map_err(|error| error.to_string())?;
+        let (program_path, program, args_path, args) = match &self.mode {
+            SubprocessMode::Command { command, args } => {
+                ("mode.command.command", command, "mode.command.args", args)
+            }
+            SubprocessMode::Script {
+                interpreter, args, ..
+            } => (
+                "mode.script.interpreter",
+                interpreter,
+                "mode.script.args",
+                args,
+            ),
+        };
+        at(program_path, reject_nul("subprocess command", program))?;
+        for (index, arg) in args.iter().enumerate() {
+            at(
+                format_args!("{args_path}[{index}]"),
+                reject_nul("subprocess argument", arg),
+            )?;
+        }
+        if let Some(cwd) = &self.cwd {
+            validate_wire_path("subprocess cwd", cwd)?;
+            at("cwd", reject_nul("subprocess cwd", &cwd.to_string_lossy()))?;
+        }
+        for (index, entry) in self.env.iter().enumerate() {
+            at(
+                format_args!("env[{index}].key"),
+                validate_env_name(entry.key()),
+            )?;
+            at(
+                format_args!("env[{index}].value"),
+                validate_env_value(entry.key(), entry.value()),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_wire_path(field: &str, path: &Path) -> Result<(), String> {
+    if path.to_str().is_none() {
+        return Err(format!("{field} must contain valid UTF-8"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

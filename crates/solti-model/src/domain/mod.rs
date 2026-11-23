@@ -9,21 +9,29 @@
 //! | `environment/`  | [`TaskEnv`]                                                       | Task-provided environment variables         |
 //! | `query/`        | [`TaskQuery`], [`TaskRunQuery`], continuations and pages          | Task filtering and collections              |
 //! | `identity/`     | [`AgentId`], [`Slot`], [`TaskId`]                                 | Resource identity (`Arc<str>`)              |
-//! | `kind/`         | [`TaskWorkload`]                                                  | Typed and extensible workload model         |
 //! | `label`         | [`Labels`]                                                        | Key-value metadata (`BTreeMap`)             |
 //! | `flag`          | [`Flag`]                                                          | Boolean toggle                              |
 //! | `kv`            | [`KeyValue`]                                                      | Generic key-value pair                      |
 //! | `phase`         | [`TaskPhase`]                                                     | Task lifecycle state                        |
 //! | `timeout`       | [`Timeout`]                                                       | Milliseconds                                |
 //! | `capability`    | [`AgentCapabilities`], [`RunnerCapability`]                       | Agent execution capabilities                |
+//! | `workload/`     | [`TaskWorkload`], [`Workload`], [`WorkloadBody`], [`WorkloadSchema`] | Routed workloads and their schemas       |
 
 mod capability;
-pub use capability::{AgentCapabilities, RunnerCapability};
+pub use capability::{
+    AgentCapabilities, MAX_AGENT_RUNNERS, MAX_AGENT_WORKLOAD_SCHEMAS, MAX_RUNNER_WORKLOAD_TYPES,
+    RunnerCapability,
+};
 
-mod kind;
-pub use kind::{
-    ContainerSpec, EmbeddedSpec, ExtensionWorkload, MAX_SCRIPT_BODY_BYTES, SubprocessMode,
-    SubprocessSpec, TaskWorkload, WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
+mod workload;
+#[cfg(feature = "schema")]
+pub use workload::{BoundJsonSafeIntegers, workload_schema_for};
+pub use workload::{
+    EMBEDDED_WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND, EmbeddedSpec, MAX_JSON_SAFE_INTEGER,
+    MAX_WORKLOAD_BODY_DEPTH, MAX_WORKLOAD_SCHEMA_BYTES, SchemaFingerprint, TaskWorkload,
+    WORKLOAD_SCHEMA_DIALECT, Workload, WorkloadBody, WorkloadBodyError, WorkloadBodyErrorKind,
+    WorkloadDecl, WorkloadDeclError, WorkloadSchema, WorkloadSchemaError,
+    WorkloadSchemaErrorReason, WorkloadType, WorkloadTypeMeta, canonical_json,
 };
 
 mod identity;

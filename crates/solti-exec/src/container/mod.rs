@@ -32,6 +32,9 @@ pub use policy::ContainerProcessPolicy;
 mod runner;
 pub use runner::ContainerRunner;
 
+mod spec;
+pub use spec::{CONTAINER_KIND, ContainerSpec};
+
 #[cfg(feature = "containerd")]
 #[cfg_attr(docsrs, doc(cfg(feature = "containerd")))]
 pub mod containerd;

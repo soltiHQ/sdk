@@ -7,8 +7,9 @@
 //!
 //! ```text
 //! register
-//!    ├── validate name, labels, and workload GVKs
-//!    └── store immutable capability snapshot
+//!    ├── validate name, labels, and workload declarations
+//!    ├── check the agent-wide caps on runners and schemas
+//!    └── store immutable capability snapshot and body checks
 //!
 //! Task
 //!    ├── exact workload GVK
@@ -19,10 +20,16 @@
 //! ```
 //!
 //! The first matching registration wins.
+//! Validation picks the runner the same way and runs its declared body check,
+//! so the runner that checks a body is the runner that builds the task.
 //! [`TaskWorkload::Embedded`] is not routed.
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use solti_model::{AgentCapabilities, Labels, RunnerCapability, Task, TaskWorkload};
+use solti_model::{
+    AgentCapabilities, LabelSelector, Labels, RunnerCapability, Task, TaskSpec, TaskWorkload,
+    Workload, WorkloadDecl, WorkloadTypeMeta,
+};
 use taskvisor::TaskRef;
 use tracing::{debug, instrument, trace};
 
@@ -43,6 +50,8 @@ struct RunnerEntry {
     runner: Arc<dyn Runner>,
     /// Immutable routing and discovery metadata captured at registration.
     capability: RunnerCapability,
+    /// Declarations read once at registration, keyed by their GVK.
+    decls: Arc<HashMap<WorkloadTypeMeta, WorkloadDecl>>,
 }
 
 /// One runner-built task paired with the run identity allocated by the router.
@@ -174,6 +183,33 @@ impl RunnerCatalog {
     ) -> Result<BuiltTask, RouterError> {
         build_scoped_from_entries(&self.runners, task, ctx, cancellation, scope).await
     }
+
+    /// Checks a task's workload with the runner that would build it.
+    ///
+    /// The runner is picked exactly as [`Self::build`] picks it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError::EmbeddedWorkload`] for embedded workloads.
+    /// Returns [`RouterError::NoRunner`] when no registration matches.
+    /// Returns [`RouterError::InvalidWorkload`] when the picked runner's declaration refuses the body.
+    pub fn validate(&self, spec: &TaskSpec) -> Result<(), RouterError> {
+        validate_spec_with_entries(&self.runners, spec)
+    }
+
+    /// Checks one routed workload with the first runner that matches its GVK and `selector`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError::NoRunner`] when no registration matches.
+    /// Returns [`RouterError::InvalidWorkload`] when the picked runner's declaration refuses the body.
+    pub fn validate_workload(
+        &self,
+        workload: &Workload,
+        selector: Option<&LabelSelector>,
+    ) -> Result<(), RouterError> {
+        validate_workload_with_entries(&self.runners, workload, selector)
+    }
 }
 
 /// One outer runner build after managed admission succeeds.
@@ -264,13 +300,14 @@ impl RunnerRouter {
 
     /// Registers a runner without labels.
     ///
-    /// The runner name and workload GVKs are read once.
+    /// The runner name and workload declarations are read once.
     /// Registration stores them as a validated capability snapshot.
     ///
     /// # Errors
     ///
     /// Returns [`RouterError::DuplicateRunner`] when the name is already registered.
-    /// Returns [`RouterError::InvalidCapability`] when the declaration is invalid.
+    /// Returns [`RouterError::InvalidWorkloadType`] when a declaration is unusable.
+    /// Returns [`RouterError::InvalidCapability`] when the capability is invalid or an agent-wide cap would be exceeded.
     #[inline]
     pub fn register(&mut self, runner: Arc<dyn Runner>) -> Result<(), RouterError> {
         self.register_with_labels(runner, Labels::default())
@@ -279,13 +316,18 @@ impl RunnerRouter {
     /// Registers a runner with static labels.
     ///
     /// Labels participate only in `runnerSelector` matching.
-    /// The name, labels, and workload GVKs are captured at registration.
+    /// The name, labels, and workload declarations are captured at registration.
+    ///
+    /// The agent-wide caps are checked here: at most
+    /// [`MAX_AGENT_RUNNERS`](solti_model::MAX_AGENT_RUNNERS) runners and
+    /// [`MAX_AGENT_WORKLOAD_SCHEMAS`](solti_model::MAX_AGENT_WORKLOAD_SCHEMAS) distinct schemas.
     ///
     /// # Errors
     ///
     /// Returns [`RouterError::DuplicateRunner`] when the name is already registered.
-    /// Returns [`RouterError::InvalidCapability`] when the declaration is invalid.
     /// Returns [`RouterError::InvalidLabels`] when labels violate model rules.
+    /// Returns [`RouterError::InvalidWorkloadType`] when a declaration is unusable.
+    /// Returns [`RouterError::InvalidCapability`] when the capability is invalid or an agent-wide cap would be exceeded.
     #[inline]
     pub fn register_with_labels(
         &mut self,
@@ -306,14 +348,46 @@ impl RunnerRouter {
                 runner: runner_name.clone(),
                 source,
             })?;
-        let capability =
-            RunnerCapability::new(runner_name.clone(), labels, runner.workload_types()).map_err(
-                |source| RouterError::InvalidCapability {
-                    runner: runner_name,
-                    source,
-                },
-            )?;
-        self.runners.push(RunnerEntry { runner, capability });
+        let decls = runner.workload_types();
+        let mut types = Vec::with_capacity(decls.len());
+        for decl in &decls {
+            match decl.workload_type() {
+                Ok(workload_type) => types.push(workload_type.clone()),
+                Err(error) => {
+                    return Err(RouterError::InvalidWorkloadType {
+                        runner: runner_name,
+                        api_version: error.api_version().to_owned(),
+                        kind: error.kind().to_owned(),
+                        reason: error.reason().to_owned(),
+                    });
+                }
+            }
+        }
+        let invalid_capability = |source| RouterError::InvalidCapability {
+            runner: runner_name.clone(),
+            source,
+        };
+        let capability = RunnerCapability::new(runner_name.clone(), labels, types)
+            .map_err(invalid_capability)?;
+        let mut capabilities: Vec<RunnerCapability> = self
+            .runners
+            .iter()
+            .map(|entry| entry.capability.clone())
+            .collect();
+        capabilities.push(capability.clone());
+        AgentCapabilities::new(capabilities).map_err(invalid_capability)?;
+        let decls = decls
+            .into_iter()
+            .filter_map(|decl| {
+                let meta = decl.workload_type().ok()?.meta().clone();
+                Some((meta, decl))
+            })
+            .collect();
+        self.runners.push(RunnerEntry {
+            runner,
+            capability,
+            decls: Arc::new(decls),
+        });
         Ok(())
     }
 
@@ -328,7 +402,7 @@ impl RunnerRouter {
                 .map(|entry| entry.capability.clone())
                 .collect(),
         )
-        .expect("RunnerRouter registration preserves unique runner names")
+        .expect("RunnerRouter registration checks the agent-wide caps")
     }
 
     /// Selects the first runner that matches the task.
@@ -397,6 +471,34 @@ impl RunnerRouter {
         build_unmanaged_from_entries(&self.runners, task, &self.ctx, &cancellation).await
     }
 
+    /// Checks a task's workload with the runner that would build it.
+    ///
+    /// The runner is picked exactly as [`Self::build`] picks it.
+    /// Admission calls this before it stores a spec.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError::EmbeddedWorkload`] for embedded workloads.
+    /// Returns [`RouterError::NoRunner`] when no registration matches.
+    /// Returns [`RouterError::InvalidWorkload`] when the picked runner's declaration refuses the body.
+    pub fn validate(&self, spec: &TaskSpec) -> Result<(), RouterError> {
+        validate_spec_with_entries(&self.runners, spec)
+    }
+
+    /// Checks one routed workload with the first runner that matches its GVK and `selector`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError::NoRunner`] when no registration matches.
+    /// Returns [`RouterError::InvalidWorkload`] when the picked runner's declaration refuses the body.
+    pub fn validate_workload(
+        &self,
+        workload: &Workload,
+        selector: Option<&LabelSelector>,
+    ) -> Result<(), RouterError> {
+        validate_workload_with_entries(&self.runners, workload, selector)
+    }
+
     /// Acquires managed admission for one selected outer runner build.
     ///
     /// Waiting for root admission is outside the admitted build.
@@ -429,23 +531,12 @@ impl RunnerRouter {
 }
 
 fn pick_entry<'a>(runners: &'a [RunnerEntry], task: &Task) -> Result<&'a RunnerEntry, RouterError> {
-    let selector = task.spec().runner_selector();
     let workload = task.spec().workload();
-    if matches!(workload, TaskWorkload::Embedded(_)) {
+    let TaskWorkload::Routed(routed) = workload else {
         return Err(RouterError::EmbeddedWorkload);
-    }
-    let workload_type = workload.type_meta();
-
-    let mut matching = runners.iter().filter(|entry| {
-        entry.capability.workload_types().contains(&workload_type)
-            && selector.is_none_or(|sel| sel.matches(entry.capability.labels()))
-    });
-
-    let first = matching.next().ok_or_else(|| RouterError::NoRunner {
-        api_version: workload_type.api_version().to_owned(),
-        kind: workload_type.kind().to_owned(),
-    })?;
-    if matching.next().is_some() {
+    };
+    let (first, multiple) = select(runners, &routed.type_meta(), task.spec().runner_selector())?;
+    if multiple {
         debug!(
             event = "runner.multiple_matches",
             task_name = %task.name(),
@@ -458,6 +549,52 @@ fn pick_entry<'a>(runners: &'a [RunnerEntry], task: &Task) -> Result<&'a RunnerE
         );
     }
     Ok(first)
+}
+
+/// Picks the first entry, in registration order, that declares `meta` and matches `selector`.
+///
+/// The flag tells whether another entry matched too.
+fn select<'a>(
+    runners: &'a [RunnerEntry],
+    meta: &WorkloadTypeMeta,
+    selector: Option<&LabelSelector>,
+) -> Result<(&'a RunnerEntry, bool), RouterError> {
+    let mut matching = runners.iter().filter(|entry| {
+        entry.decls.contains_key(meta)
+            && selector.is_none_or(|sel| sel.matches(entry.capability.labels()))
+    });
+    let first = matching.next().ok_or_else(|| RouterError::NoRunner {
+        api_version: meta.api_version().to_owned(),
+        kind: meta.kind().to_owned(),
+    })?;
+    Ok((first, matching.next().is_some()))
+}
+
+fn validate_spec_with_entries(runners: &[RunnerEntry], spec: &TaskSpec) -> Result<(), RouterError> {
+    let TaskWorkload::Routed(workload) = spec.workload() else {
+        return Err(RouterError::EmbeddedWorkload);
+    };
+    validate_workload_with_entries(runners, workload, spec.runner_selector())
+}
+
+fn validate_workload_with_entries(
+    runners: &[RunnerEntry],
+    workload: &Workload,
+    selector: Option<&LabelSelector>,
+) -> Result<(), RouterError> {
+    let meta = workload.type_meta();
+    let (entry, _) = select(runners, &meta, selector)?;
+    let decl = entry
+        .decls
+        .get(&meta)
+        .expect("a selected entry declares the workload GVK");
+    decl.check(workload)
+        .map_err(|reason| RouterError::InvalidWorkload {
+            runner: entry.capability.name().to_owned(),
+            api_version: meta.api_version().to_owned(),
+            kind: meta.kind().to_owned(),
+            reason,
+        })
 }
 
 async fn build_unmanaged_from_entries(
@@ -553,11 +690,14 @@ mod tests {
     use super::*;
     use crate::{OutputPublisher, OutputSink, RunId, RunnerEnv, RunnerError};
 
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+    use serde_json::{Value, json};
     use solti_model::{
-        AdmissionPolicy, BackoffPolicy, EmbeddedSpec, Flag, JitterPolicy, LabelSelector, Labels,
-        SubprocessMode, SubprocessSpec, TaskEnv, TaskId, TaskSpec, WasmSpec, WorkloadTypeMeta,
+        AdmissionPolicy, BackoffPolicy, EmbeddedSpec, JitterPolicy, TaskId,
+        WORKLOAD_SCHEMA_DIALECT, WorkloadBody,
     };
-    use std::{fmt, path::PathBuf, sync::Mutex};
+    use std::{fmt, sync::Mutex};
     use taskvisor::{TaskContext, TaskError, TaskFn};
     use tracing::{
         Event, Metadata, Subscriber,
@@ -609,7 +749,7 @@ mod tests {
 
     struct DeclaredRunner {
         name: &'static str,
-        workload_types: Vec<WorkloadTypeMeta>,
+        workload_types: Vec<WorkloadDecl>,
     }
 
     #[crate::async_trait]
@@ -618,7 +758,7 @@ mod tests {
             self.name
         }
 
-        fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
+        fn workload_types(&self) -> Vec<WorkloadDecl> {
             self.workload_types.clone()
         }
 
@@ -636,17 +776,25 @@ mod tests {
         }
     }
 
-    fn workload_type(api_version: &str, kind: &str) -> WorkloadTypeMeta {
-        WorkloadTypeMeta::new(api_version, kind).expect("valid test workload GVK")
+    const EXEC: &str = "exec.solti.io/v1";
+    const EXAMPLE: &str = "tasks.example.io/v1";
+
+    fn schema(tag: &str) -> Value {
+        json!({ "$schema": WORKLOAD_SCHEMA_DIALECT, "type": "object", "description": tag })
+    }
+
+    fn decl(api_version: &str, kind: &str) -> WorkloadDecl {
+        WorkloadDecl::new(api_version, kind, &schema("any"), |_| Ok(()))
+    }
+
+    fn routed(api_version: &str, kind: &str, body: Value) -> Workload {
+        Workload::new(api_version, kind, body).expect("valid test workload")
     }
 
     fn subprocess_runner(name: &'static str) -> DeclaredRunner {
         DeclaredRunner {
             name,
-            workload_types: vec![workload_type(
-                solti_model::WORKLOAD_API_VERSION,
-                "Subprocess",
-            )],
+            workload_types: vec![decl(EXEC, "Subprocess")],
         }
     }
 
@@ -669,14 +817,10 @@ mod tests {
     }
 
     fn subprocess_task() -> Task {
-        mk_task(TaskWorkload::Subprocess(SubprocessSpec::new(
-            SubprocessMode::Command {
-                command: "echo".into(),
-                args: vec!["hello".into()],
-            },
-            TaskEnv::default(),
-            None,
-            Flag::enabled(),
+        mk_task(TaskWorkload::Routed(routed(
+            EXEC,
+            "Subprocess",
+            json!({ "command": "echo" }),
         )))
     }
 
@@ -779,17 +923,17 @@ mod tests {
             .register(Arc::new(subprocess_runner("subprocess-only")))
             .unwrap();
 
-        let task = mk_task(TaskWorkload::Wasm(WasmSpec::new(
-            PathBuf::from("mod.wasm"),
-            Vec::new(),
-            TaskEnv::default(),
+        let task = mk_task(TaskWorkload::Routed(routed(
+            EXAMPLE,
+            "Wasm",
+            json!({ "module": "mod.wasm" }),
         )));
 
         let res = router.build(&task).await;
 
         match res {
             Err(RouterError::NoRunner { api_version, kind }) => {
-                assert_eq!(api_version, "solti.io/v1");
+                assert_eq!(api_version, EXAMPLE);
                 assert_eq!(kind, "Wasm");
             }
             Ok(_) => panic!("expected RouterError::NoRunner for wasm, got Ok(..)"),
@@ -805,14 +949,10 @@ mod tests {
         router
             .register(Arc::new(subprocess_runner("subprocess-only")))
             .unwrap();
-        let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-            SubprocessMode::Command {
-                command: "echo".into(),
-                args: vec![SECRET.into()],
-            },
-            TaskEnv::default(),
-            None,
-            Flag::enabled(),
+        let workload = TaskWorkload::Routed(routed(
+            EXEC,
+            "Subprocess",
+            json!({ "command": "echo", "args": [SECRET] }),
         ));
         let spec = TaskSpec::builder("trace-test-slot", workload, 10_000_u64)
             .build()
@@ -854,11 +994,8 @@ mod tests {
                 "context"
             }
 
-            fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-                vec![workload_type(
-                    solti_model::WORKLOAD_API_VERSION,
-                    "Subprocess",
-                )]
+            fn workload_types(&self) -> Vec<WorkloadDecl> {
+                vec![decl(EXEC, "Subprocess")]
             }
 
             async fn build_task(
@@ -921,11 +1058,8 @@ mod tests {
                 self.name
             }
 
-            fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-                vec![workload_type(
-                    solti_model::WORKLOAD_API_VERSION,
-                    "Subprocess",
-                )]
+            fn workload_types(&self) -> Vec<WorkloadDecl> {
+                vec![decl(EXEC, "Subprocess")]
             }
 
             async fn build_task(
@@ -973,7 +1107,7 @@ mod tests {
         router
             .register(Arc::new(DeclaredRunner {
                 name: "registered-later",
-                workload_types: vec![workload_type("tasks.example.io/v1", "ImageResize")],
+                workload_types: vec![decl("tasks.example.io/v1", "ImageResize")],
             }))
             .unwrap();
 
@@ -1001,14 +1135,11 @@ mod tests {
             .unwrap();
         assert!(built.name().starts_with("catalog-us-first-test-slot-"));
 
-        let later_task = mk_task(TaskWorkload::Extension(
-            solti_model::ExtensionWorkload::new(
-                "tasks.example.io/v1",
-                "ImageResize",
-                serde_json::json!({ "width": 1280 }),
-            )
-            .unwrap(),
-        ));
+        let later_task = mk_task(TaskWorkload::Routed(routed(
+            EXAMPLE,
+            "ImageResize",
+            json!({ "width": 1280 }),
+        )));
         assert!(matches!(
             cloned_catalog.build(&later_task, &explicit_ctx).await,
             Err(RouterError::NoRunner { .. })
@@ -1044,20 +1175,14 @@ mod tests {
 
     #[tokio::test]
     async fn application_defined_gvk_routes_through_registered_runner() {
-        let workload = TaskWorkload::Extension(
-            solti_model::ExtensionWorkload::new(
-                "tasks.example.io/v1",
-                "ImageResize",
-                serde_json::json!({ "width": 1280 }),
-            )
-            .unwrap(),
-        );
+        let workload =
+            TaskWorkload::Routed(routed(EXAMPLE, "ImageResize", json!({ "width": 1280 })));
         let task = mk_task(workload);
         let mut router = RunnerRouter::new();
         router
             .register(Arc::new(DeclaredRunner {
                 name: "image-resize",
-                workload_types: vec![workload_type("tasks.example.io/v1", "ImageResize")],
+                workload_types: vec![decl("tasks.example.io/v1", "ImageResize")],
             }))
             .unwrap();
 
@@ -1104,21 +1229,11 @@ mod tests {
             },
             DeclaredRunner {
                 name: "duplicate-workload",
-                workload_types: vec![
-                    workload_type(solti_model::WORKLOAD_API_VERSION, "Subprocess"),
-                    workload_type(solti_model::WORKLOAD_API_VERSION, "Subprocess"),
-                ],
-            },
-            DeclaredRunner {
-                name: "embedded-workload",
-                workload_types: vec![workload_type(solti_model::WORKLOAD_API_VERSION, "Embedded")],
+                workload_types: vec![decl(EXEC, "Subprocess"), decl(EXEC, "Subprocess")],
             },
             DeclaredRunner {
                 name: "invalid/name",
-                workload_types: vec![workload_type(
-                    solti_model::WORKLOAD_API_VERSION,
-                    "Subprocess",
-                )],
+                workload_types: vec![decl(EXEC, "Subprocess")],
             },
         ];
         let mut router = RunnerRouter::new();
@@ -1144,7 +1259,7 @@ mod tests {
         router
             .register(Arc::new(DeclaredRunner {
                 name: "image-resize",
-                workload_types: vec![workload_type("tasks.example.io/v1", "ImageResize")],
+                workload_types: vec![decl("tasks.example.io/v1", "ImageResize")],
             }))
             .unwrap();
 
@@ -1158,7 +1273,7 @@ mod tests {
                 .iter()
                 .map(|workload| (workload.api_version(), workload.kind()))
                 .collect::<Vec<_>>(),
-            vec![("solti.io/v1", "Subprocess")]
+            vec![(EXEC, "Subprocess")]
         );
         assert_eq!(router.capabilities().runners().len(), 2);
     }
@@ -1173,11 +1288,8 @@ mod tests {
                 "failing"
             }
 
-            fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-                vec![workload_type(
-                    solti_model::WORKLOAD_API_VERSION,
-                    "Subprocess",
-                )]
+            fn workload_types(&self) -> Vec<WorkloadDecl> {
+                vec![decl(EXEC, "Subprocess")]
             }
 
             async fn build_task(
@@ -1218,11 +1330,8 @@ mod tests {
                 "identity-agnostic"
             }
 
-            fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-                vec![
-                    WorkloadTypeMeta::new(solti_model::WORKLOAD_API_VERSION, "Subprocess")
-                        .expect("built-in workload GVK"),
-                ]
+            fn workload_types(&self) -> Vec<WorkloadDecl> {
+                vec![decl(EXEC, "Subprocess")]
             }
 
             async fn build_task(
@@ -1259,5 +1368,19 @@ mod tests {
         assert!(built.name().starts_with("identity-agnostic-test-slot-"));
         let task = Arc::clone(built.task());
         assert!(Arc::ptr_eq(&task, &built.into_task()));
+    }
+
+    // --- declared types, first-match routing, validation ---
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)] // only decoded and described
+    struct Resize {
+        width: u32,
+    }
+
+    impl WorkloadBody for Resize {
+        const API_VERSION: &'static str = EXAMPLE;
+        const KIND: &'static str = "Resize";
     }
 }

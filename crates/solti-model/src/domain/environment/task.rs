@@ -19,6 +19,12 @@ env_newtype! {
     ///
     /// assert_eq!(env.get("APP_MODE"), Some("prod"));
     /// ```
+    #[cfg_attr(
+        feature = "schema",
+        schemars(
+            description = "Environment variables passed to a task at submission time. Duplicate keys are allowed; lookup uses the last value."
+        )
+    )]
     pub struct TaskEnv;
 }
 

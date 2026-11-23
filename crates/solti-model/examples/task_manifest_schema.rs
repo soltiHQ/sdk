@@ -11,10 +11,7 @@
 //!
 //! Run with `cargo run -p solti-model --example task_manifest_schema`.
 
-use solti_model::{
-    Flag, Labels, ModelError, SubprocessMode, SubprocessSpec, TaskEnv, TaskManifest, TaskSpec,
-    TaskWorkload,
-};
+use solti_model::{Labels, ModelError, TaskManifest, TaskSpec, TaskWorkload, Workload};
 
 const FLOW: &str = r#"
 solti-model: runtime model and JSON Schema
@@ -30,15 +27,16 @@ solti-model: runtime model and JSON Schema
 "#;
 
 fn task_manifest() -> Result<TaskManifest, ModelError> {
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
-        SubprocessMode::Command {
-            command: "thumbnail-worker".into(),
-            args: vec!["--source".into(), "cover.png".into()],
-        },
-        TaskEnv::default(),
-        None,
-        Flag::enabled(),
-    ));
+    let workload = TaskWorkload::from(Workload::new(
+        "exec.solti.io/v1",
+        "Subprocess",
+        serde_json::json!({
+            "mode": {
+                "command": "thumbnail-worker",
+                "args": ["--source", "cover.png"]
+            }
+        }),
+    )?);
     let spec = TaskSpec::builder("media", workload, 30_000_u64).build()?;
 
     let mut labels = Labels::new();
@@ -107,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("[schema] reusable definitions={}", definitions.len());
     println!("[schema] TaskWorkload variants={}", workload_variants.len());
-    assert_eq!(workload_variants.len(), 5);
+    assert_eq!(workload_variants.len(), 2);
 
     let mut unknown = document.clone();
     unknown

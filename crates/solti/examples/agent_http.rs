@@ -62,7 +62,7 @@ cat >"$MANIFEST" <<'JSON'
   "spec": {
     "slot": "http-example",
     "workload": {
-      "apiVersion": "solti.io/v1",
+      "apiVersion": "exec.solti.io/v1",
       "kind": "Subprocess",
       "spec": {
         "mode": {

@@ -9,13 +9,33 @@ use solti::{
         AgentEndpoint, AgentEndpointType, ControlPlaneEndpoint, DISCOVERY_HTTP_SYNC_PATH,
         DiscoverConfig, DiscoveryTransport, MonotonicUptime, sync,
     },
-    exec::subprocess::register_subprocess_runner,
+    exec::subprocess::{SubprocessRunner, register_subprocess_runner},
     model::AgentId,
     runner::RunnerRouter,
 };
 use tokio::net::TcpListener;
+use tracing_subscriber::EnvFilter;
 
 pub type ExampleResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// Prints the agent's `tracing` events, the `discovery.*` ones included, as text on stderr.
+///
+/// `RUST_LOG` sets the filter, an `EnvFilter` expression such as `debug` or
+/// `info,solti_discover=debug`. Without it, INFO and above are printed.
+pub fn init_logging() -> ExampleResult {
+    let filter = match env::var("RUST_LOG") {
+        Ok(directives) => EnvFilter::try_new(directives)?,
+        Err(env::VarError::NotPresent) => EnvFilter::new("info"),
+        Err(error) => return Err(error.into()),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .with_ansi(false)
+        .try_init()
+        .map_err(io::Error::other)?;
+    Ok(())
+}
 
 pub struct Defaults {
     pub agent_id: &'static str,
@@ -94,6 +114,11 @@ fn base_url(name: &str, value: &str) -> ExampleResult<String> {
     Ok(value.into())
 }
 
+/// Registers the runners this agent serves; discovery advertises exactly their declared types.
+pub fn register_runners(router: &mut RunnerRouter) -> ExampleResult<Arc<SubprocessRunner>> {
+    Ok(register_subprocess_runner(router, "default")?)
+}
+
 pub async fn run(settings: Settings) -> ExampleResult {
     let agent_id = AgentId::new(&settings.agent_id)?;
     let listener = TcpListener::bind(&settings.api_address).await?;
@@ -110,14 +135,20 @@ pub async fn run(settings: Settings) -> ExampleResult {
         None => format!("http://{bound}"),
     };
     let mut router = RunnerRouter::new();
-    let subprocess_runner = register_subprocess_runner(&mut router, "default")?;
+    let subprocess_runner = register_runners(&mut router)?;
     let run_result = async {
         let capabilities = router.capabilities();
-        println!(
-            "[runner] Registered {} runner capability with {} workload GVK.",
-            capabilities.runners().len(),
-            capabilities.runners()[0].workload_types().len(),
-        );
+        for runner in capabilities.runners() {
+            for declared in runner.workload_types() {
+                println!(
+                    "[runner] runner={} declares {}/{} schemaFingerprint={}",
+                    runner.name(),
+                    declared.api_version(),
+                    declared.kind(),
+                    declared.fingerprint(),
+                );
+            }
+        }
         let config = DiscoverConfig::builder(
             agent_id,
             settings.agent_name,

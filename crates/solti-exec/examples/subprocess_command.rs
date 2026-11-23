@@ -22,10 +22,8 @@ use std::{
 use solti_exec::subprocess::{
     CwdPolicy, EnvPolicy, SubprocessBackendConfig, register_subprocess_runner_with_backend,
 };
-use solti_model::{
-    Flag, OutputEvent, SubprocessMode, SubprocessSpec, Task, TaskEnv, TaskId, TaskSpec,
-    TaskWorkload,
-};
+use solti_exec::subprocess::{SubprocessMode, SubprocessSpec};
+use solti_model::{Flag, OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
 use solti_runner::{
     BuildContext, OutputPublisher, OutputPublisherHandle, OutputSink, RunnerEnv, RunnerRouter,
 };
@@ -108,7 +106,7 @@ async fn main() -> ExampleResult {
 printf 'task=%s\n' "$TASK_VALUE"
 printf 'shared=%s\n' "$SHARED"
 printf 'diagnostic=example\n' >&2"#;
-    let workload = TaskWorkload::Subprocess(SubprocessSpec::new(
+    let workload = TaskWorkload::from_body(&SubprocessSpec::new(
         SubprocessMode::Command {
             command: "/bin/sh".into(),
             args: vec!["-c".into(), script.into()],
@@ -116,7 +114,7 @@ printf 'diagnostic=example\n' >&2"#;
         task_env,
         Some(canonical_workdir.clone()),
         Flag::enabled(),
-    ));
+    ))?;
     let spec = TaskSpec::builder("jobs", workload, 5_000_u64).build()?;
     let task = Task::new("inspect-process-boundary", spec)?;
     println!("[setup/task] Task sets TASK_VALUE and SHARED; runner SHARED must win.");

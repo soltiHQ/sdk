@@ -94,7 +94,7 @@ async fn host_process_policy_is_applied_to_spawned_command() {
 
 #[test]
 fn max_script_body_bytes_defaults_to_model_const_and_is_configurable() {
-    use solti_model::MAX_SCRIPT_BODY_BYTES;
+    use crate::subprocess::MAX_SCRIPT_BODY_BYTES;
 
     let default_cfg = SubprocessBackendConfig::new().prepare().unwrap();
     assert_eq!(default_cfg.max_script_body_bytes(), MAX_SCRIPT_BODY_BYTES);

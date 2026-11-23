@@ -10,13 +10,6 @@ pub(crate) fn non_empty_string(_generator: &mut schemars::SchemaGenerator) -> Sc
     })
 }
 
-pub(crate) fn path_string(_generator: &mut schemars::SchemaGenerator) -> Schema {
-    json_schema!({
-        "type": "string",
-        "minLength": 1
-    })
-}
-
 pub(crate) fn task_id(_generator: &mut schemars::SchemaGenerator) -> Schema {
     json_schema!({
         "type": "string",
@@ -90,16 +83,6 @@ pub(crate) fn annotations(generator: &mut schemars::SchemaGenerator) -> Schema {
     })
 }
 
-pub(crate) fn script_body(_generator: &mut schemars::SchemaGenerator) -> Schema {
-    let max_encoded_len = crate::MAX_SCRIPT_BODY_BYTES.div_ceil(3) * 4;
-    json_schema!({
-        "type": "string",
-        "minLength": 1,
-        "maxLength": max_encoded_len,
-        "contentEncoding": "base64"
-    })
-}
-
 pub(crate) fn condition_type(_generator: &mut schemars::SchemaGenerator) -> Schema {
     qualified_name_with_max(crate::resource::CONDITION_TYPE_MAX_BYTES)
 }
@@ -132,7 +115,7 @@ fn qualified_name_with_max(max_length: usize) -> Schema {
                 "pattern": "^[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$"
             },
             {
-                "pattern": "^(?=.{1,253}/)[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*/[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$"
+                "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*/[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$"
             }
         ]
     })
@@ -143,16 +126,6 @@ pub(crate) fn label_value(_generator: &mut schemars::SchemaGenerator) -> Schema 
         "type": "string",
         "maxLength": crate::validation::QUALIFIED_NAME_MAX_LEN,
         "pattern": "^(?:[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$"
-    })
-}
-
-pub(crate) fn runner_name(generator: &mut schemars::SchemaGenerator) -> Schema {
-    let value = label_value(generator);
-    json_schema!({
-        "allOf": [
-            value,
-            { "minLength": 1 }
-        ]
     })
 }
 
@@ -170,11 +143,11 @@ pub(crate) fn crd_api_version(_generator: &mut schemars::SchemaGenerator) -> Sch
         "maxLength": crate::validation::DNS1123_SUBDOMAIN_MAX_LEN
             + 1
             + crate::validation::DNS1035_LABEL_MAX_LEN,
-        "pattern": "^(?=.{1,253}/)[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)+/[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$"
+        "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)+/[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$"
     })
 }
 
-pub(crate) fn extension_api_version(generator: &mut schemars::SchemaGenerator) -> Schema {
+pub(crate) fn routed_api_version(generator: &mut schemars::SchemaGenerator) -> Schema {
     let api_version = crd_api_version(generator);
     json_schema!({
         "allOf": [
@@ -230,30 +203,6 @@ pub(crate) fn selector_requirement(generator: &mut schemars::SchemaGenerator) ->
                 }
             }
         ]
-    })
-}
-
-pub(crate) fn runner_workload_types(generator: &mut schemars::SchemaGenerator) -> Schema {
-    let workload = generator.subschema_for::<crate::WorkloadTypeMeta>();
-    json_schema!({
-        "type": "array",
-        "minItems": 1,
-        "uniqueItems": true,
-        "items": {
-            "allOf": [
-                workload,
-                {
-                    "not": {
-                        "type": "object",
-                        "required": ["apiVersion", "kind"],
-                        "properties": {
-                            "apiVersion": { "const": crate::WORKLOAD_API_VERSION },
-                            "kind": { "const": "Embedded" }
-                        }
-                    }
-                }
-            ]
-        }
     })
 }
 
@@ -487,18 +436,14 @@ pub(crate) fn base64_bytes(_generator: &mut schemars::SchemaGenerator) -> Schema
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use jsonschema::Validator;
     use schemars::JsonSchema;
     use serde::Serialize;
     use serde_json::{Value, json};
 
     use crate::{
-        AgentCapabilities, Annotations, ContainerSpec, EmbeddedSpec, ExtensionWorkload, Flag,
-        Labels, RunnerCapability, SelectorRequirement, SubprocessMode, SubprocessSpec,
-        TaskConditionType, TaskEnv, TaskManifest, TaskRun, TaskSpec, TaskStatus, TaskWorkload,
-        WORKLOAD_API_VERSION, WasmSpec, WorkloadTypeMeta,
+        Annotations, EmbeddedSpec, Labels, SelectorRequirement, Task, TaskConditionType,
+        TaskManifest, TaskRun, TaskSpec, TaskStatus, TaskWorkload, Workload, WorkloadTypeMeta,
     };
 
     fn validator<T: JsonSchema>() -> Validator {
@@ -530,59 +475,19 @@ mod tests {
     #[test]
     fn task_manifest_schema_accepts_every_model_workload() {
         let workloads = [
-            TaskWorkload::Subprocess(SubprocessSpec::new(
-                SubprocessMode::Command {
-                    command: "echo".into(),
-                    args: vec!["hello".into()],
-                },
-                TaskEnv::default(),
-                None,
-                Flag::enabled(),
-            )),
-            TaskWorkload::Wasm(WasmSpec::new(
-                PathBuf::from("job.wasm"),
-                Vec::new(),
-                TaskEnv::default(),
-            )),
-            TaskWorkload::Container(ContainerSpec::new(
-                "docker.io/library/busybox:1".into(),
-                None,
-                Vec::new(),
-                TaskEnv::default(),
-            )),
             TaskWorkload::Embedded(EmbeddedSpec::new("test-v1").unwrap()),
-            TaskWorkload::Extension(
-                ExtensionWorkload::new(
-                    "workloads.example.io/v1",
-                    "Resize",
-                    json!({ "width": 320 }),
+            TaskWorkload::Routed(
+                Workload::new("workloads.example.io/v1", "Resize", json!({ "width": 320 }))
+                    .unwrap(),
+            ),
+            TaskWorkload::Routed(
+                Workload::new(
+                    "exec.solti.io/v1",
+                    "Subprocess",
+                    json!({ "mode": { "command": "echo" } }),
                 )
                 .unwrap(),
             ),
-        ];
-
-        for workload in workloads {
-            assert_valid(&manifest(workload));
-        }
-    }
-
-    #[test]
-    fn task_manifest_schema_accepts_unicode_wire_paths() {
-        let workloads = [
-            TaskWorkload::Subprocess(SubprocessSpec::new(
-                SubprocessMode::Command {
-                    command: "echo".into(),
-                    args: Vec::new(),
-                },
-                TaskEnv::default(),
-                Some(PathBuf::from("/工作/δ")),
-                Flag::enabled(),
-            )),
-            TaskWorkload::Wasm(WasmSpec::new(
-                PathBuf::from("/модули/报告.wasm"),
-                Vec::new(),
-                TaskEnv::default(),
-            )),
         ];
 
         for workload in workloads {
@@ -613,7 +518,7 @@ mod tests {
 
     #[test]
     fn task_run_schema_rejects_impossible_lifecycle_shapes() {
-        let workload = WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap();
+        let workload = WorkloadTypeMeta::new("exec.solti.io/v1", "Subprocess").unwrap();
         let mut active = TaskRun::starting(1, 1, workload).unwrap();
         assert_valid(&active);
 
@@ -677,7 +582,7 @@ mod tests {
             assert!(!schema.is_valid(&invalid), "expected invalid: {invalid}");
         }
 
-        let mut task = crate::Task::from_manifest(manifest(TaskWorkload::Embedded(
+        let mut task = Task::from_manifest(manifest(TaskWorkload::Embedded(
             EmbeddedSpec::new("test-v1").unwrap(),
         )))
         .unwrap();
@@ -694,7 +599,7 @@ mod tests {
         let oversized = "a".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES + 1);
         let multibyte_over_byte_budget = "🙂".repeat(crate::MAX_TASK_DIAGNOSTIC_BYTES / 4 + 1);
 
-        let workload = WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap();
+        let workload = WorkloadTypeMeta::new("exec.solti.io/v1", "Subprocess").unwrap();
         let mut run = TaskRun::starting(1, 1, workload).unwrap();
         run.finish(crate::TaskPhase::Failed, Some("failure".into()), None)
             .unwrap();
@@ -708,7 +613,7 @@ mod tests {
             &[],
         )));
 
-        let mut task = crate::Task::from_manifest(manifest(TaskWorkload::Embedded(
+        let mut task = Task::from_manifest(manifest(TaskWorkload::Embedded(
             EmbeddedSpec::new("test-v1").unwrap(),
         )))
         .unwrap();
@@ -743,33 +648,6 @@ mod tests {
     }
 
     #[test]
-    fn capability_schema_rejects_empty_and_embedded_runner_contracts() {
-        let capability = RunnerCapability::new(
-            "subprocess",
-            Labels::new(),
-            vec![WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap()],
-        )
-        .unwrap();
-        assert_valid(&capability);
-        assert_valid(&AgentCapabilities::new(vec![capability]).unwrap());
-
-        let schema = validator::<RunnerCapability>();
-        assert!(!schema.is_valid(&json!({
-            "name": "runner",
-            "labels": {},
-            "workloadTypes": []
-        })));
-        assert!(!schema.is_valid(&json!({
-            "name": "runner",
-            "labels": {},
-            "workloadTypes": [{
-                "apiVersion": WORKLOAD_API_VERSION,
-                "kind": "Embedded"
-            }]
-        })));
-    }
-
-    #[test]
     fn qualified_name_schemas_match_component_limits() {
         let name_64 = "a".repeat(64);
         let prefix_253 = format!("{}.a", "a".repeat(251));
@@ -785,16 +663,14 @@ mod tests {
         assert!(labels.validate().is_err());
         assert!(!validator::<Labels>().is_valid(&serde_json::to_value(&labels).unwrap()));
 
+        // The 253-byte prefix bound is runtime validation only: the schema
+        // carries no lookahead, so it bounds the whole key by `maxLength`.
         let selector_key = format!("{prefix_254}/name");
         assert!(
             SelectorRequirement::exists(&selector_key)
                 .validate()
                 .is_err()
         );
-        assert!(!validator::<SelectorRequirement>().is_valid(&json!({
-            "key": selector_key,
-            "operator": "Exists"
-        })));
 
         let valid_condition = format!("{prefix_253}/{}", "a".repeat(62));
         let oversized_condition = format!("{prefix_253}/{}", "a".repeat(63));
@@ -824,16 +700,21 @@ mod tests {
             "apiVersion": valid,
             "kind": "Example"
         })));
-        for invalid in [&oversized_group, &oversized_version] {
-            assert!(!workload_schema.is_valid(&json!({
-                "apiVersion": invalid,
-                "kind": "Example"
-            })));
-        }
+        // The 253-byte group bound is runtime validation only (no lookahead
+        // in the schema); the version bound stays in the pattern.
+        assert!(!workload_schema.is_valid(&json!({
+            "apiVersion": oversized_version,
+            "kind": "Example"
+        })));
 
-        let extension_schema = validator::<ExtensionWorkload>();
-        assert!(!extension_schema.is_valid(&json!({
-            "apiVersion": oversized_group,
+        let routed_schema = validator::<Workload>();
+        assert!(routed_schema.is_valid(&json!({
+            "apiVersion": valid,
+            "kind": "Example",
+            "spec": {}
+        })));
+        assert!(!routed_schema.is_valid(&json!({
+            "apiVersion": oversized_version,
             "kind": "Example",
             "spec": {}
         })));

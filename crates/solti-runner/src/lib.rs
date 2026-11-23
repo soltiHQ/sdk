@@ -26,6 +26,7 @@
 //!
 //! The router checks runners in registration order.
 //! The first matching runner is selected.
+//! [`RunnerRouter::validate`] checks a task's workload body with that same runner's declared check.
 //!
 //! [`solti_model::TaskWorkload::Embedded`] bypasses this flow.
 //! The router rejects it before runner selection.
@@ -33,8 +34,10 @@
 //! ## Registration
 //!
 //! Registration captures an immutable capability snapshot.
-//! The snapshot contains the runner name, labels, and supported workload GVKs.
-//! Routing and agent capability discovery use the same snapshot.
+//! The snapshot contains the runner name, labels, and declared workload types with their schema fingerprints.
+//! A runner declares each type as a [`solti_model::WorkloadDecl`]: GVK, JSON Schema and body check.
+//! An unusable declaration, more than 64 runners or more than 256 distinct schemas fail registration.
+//! Routing, validation and agent capability discovery use the same snapshot.
 //! [`RunnerRouter::catalog`] additionally captures the registered runner handles and their routing order for composition.
 //!
 //! ## Build Contract
@@ -79,15 +82,15 @@
 //! use std::sync::Arc;
 //! use solti_runner::RunnerRouter;
 //!
-//! # use solti_model::{Task, WorkloadTypeMeta, WORKLOAD_API_VERSION};
+//! # use solti_model::{Task, WorkloadDecl};
 //! # use solti_runner::{BuildContext, BuiltTask, RunId, Runner, RunnerError};
 //! # use taskvisor::{TaskContext, TaskError, TaskFn, TaskRef};
 //! # struct MyRunner;
 //! # #[solti_runner::async_trait]
 //! # impl Runner for MyRunner {
 //! #     fn name(&self) -> &str { "my-runner" }
-//! #     fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-//! #         vec![WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").expect("built-in workload GVK")]
+//! #     fn workload_types(&self) -> Vec<WorkloadDecl> {
+//! #         vec![WorkloadDecl::object("tasks.example.io/v1", "Echo")]
 //! #     }
 //! #     async fn build_task(&self, _task: &Task, _run_id: &RunId, _ctx: &BuildContext, _cancellation: &solti_runner::BuildCancellation, _scope: &mut solti_runner::BuildScope) -> Result<TaskRef, RunnerError> {
 //! #         Ok(TaskFn::arc(|_ctx: TaskContext| async move { Ok::<(), TaskError>(()) }))

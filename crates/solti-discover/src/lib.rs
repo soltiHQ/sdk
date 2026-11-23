@@ -48,6 +48,20 @@
 //! Taskvisor schedules retry backoff after the failed attempt.
 //! Any remaining server hold is awaited before the next request.
 //!
+//! A failed schema follow-up is logged at WARN and does not fail the attempt.
+//!
+//! ## Workload Schemas
+//!
+//! Capabilities carry the schema fingerprint of each workload type.
+//! The control plane lists the schemas it lacks in `want_schemas`.
+//! Follow-up requests in the same attempt carry them; the heartbeat never
+//! does, so schema delivery can never fail it.
+//! Each follow-up takes as many as fit the encoded request budget of the
+//! transport in use: 256 KiB minus 1 KiB of headroom.
+//! A heartbeat that is over that budget is refused by `sync` with
+//! [`DiscoverError::InvalidConfig`].
+//! `CONTRACT.md` describes the exchange.
+//!
 //! ## Time Units
 //!
 //! Public duration arguments ending in `_ms` use milliseconds.

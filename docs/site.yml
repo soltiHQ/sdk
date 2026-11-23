@@ -58,3 +58,4 @@ navigation:
     pages:
       - example-catalog
       - api-reference
+      - migrating-from-0-0

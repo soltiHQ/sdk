@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use solti_model::{ContainerSpec, Task, TaskWorkload, WORKLOAD_API_VERSION, WorkloadTypeMeta};
+use solti_model::{Task, WorkloadDecl};
 use solti_runner::{
     BuildContext, OutputPublisherHandle, RunId, Runner, RunnerError, RunnerErrorKind, RunnerType,
     merge_env, record_runner_error, request_output_sink,
@@ -20,14 +20,15 @@ use tracing::{Instrument as _, debug, debug_span, trace, warn};
 use super::{
     ContainerAttempt, ContainerEngine, ContainerEngineBinding, ContainerEngineError,
     ContainerErrorClass, ContainerExitStatus, ContainerOwnershipContract, ContainerRequest,
-    ContainerRunnerConfig,
+    ContainerRunnerConfig, ContainerSpec,
+    spec::{validate_env_name, validate_env_value, validate_process_word},
 };
 use crate::{
     output::{LogConfig, OutputDrain, OutputTasks, StreamKind, log_stream},
-    registration::validate_runner_name,
+    registration::{decode_workload, validate_runner_name},
 };
 
-/// Runner for `solti.io/v1`, kind `Container` workloads.
+/// Runner for `exec.solti.io/v1` `Container` workloads, decoded as [`ContainerSpec`].
 ///
 /// Construction requires an explicit [`ContainerEngineBinding`].
 /// The binding records the engine provider's dropped-lifecycle ownership contract.
@@ -120,11 +121,8 @@ impl Runner for ContainerRunner {
         &self.name
     }
 
-    fn workload_types(&self) -> Vec<WorkloadTypeMeta> {
-        vec![
-            WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Container")
-                .expect("built-in workload GVK"),
-        ]
+    fn workload_types(&self) -> Vec<WorkloadDecl> {
+        vec![WorkloadDecl::of::<ContainerSpec>()]
     }
 
     async fn build_task(
@@ -141,27 +139,18 @@ impl Runner for ContainerRunner {
             args,
             env,
             ..
-        } = match task.spec().workload() {
-            TaskWorkload::Container(spec) => spec,
-            other => {
-                return Err(RunnerError::UnsupportedWorkload {
-                    runner: self.name.clone(),
-                    api_version: other.api_version().to_owned(),
-                    kind: other.kind().to_owned(),
-                });
-            }
-        };
+        } = decode_workload::<ContainerSpec>(&self.name, task.spec().workload())?;
 
-        validate_process_input(command.as_deref(), args, env, ctx)?;
+        validate_process_input(command.as_deref(), &args, &env, ctx)?;
 
         let task_config = ContainerTaskConfig {
             run_id: Arc::from(run_id.name()),
             resource_name: task.name().clone(),
             generation: task.metadata().generation(),
-            image: image.clone(),
-            command: command.clone().filter(|command| !command.is_empty()),
-            args: args.clone(),
-            env: merge_env(env, ctx.env()),
+            image,
+            command: command.filter(|command| !command.is_empty()),
+            args,
+            env: merge_env(&env, ctx.env()),
             process_policy: self.config.process_policy().clone(),
         };
 
@@ -189,24 +178,22 @@ impl Runner for ContainerRunner {
     }
 }
 
+/// Applies [`ContainerSpec`]'s process-input rules to the task's input and the runner's
+/// environment, which admission does not see.
 fn validate_process_input(
     command: Option<&[String]>,
     args: &[String],
     task_env: &solti_model::TaskEnv,
     build: &BuildContext,
 ) -> Result<(), RunnerError> {
-    if command
+    command
         .into_iter()
         .flatten()
         .chain(args)
-        .any(|value| value.contains('\0'))
-    {
-        return Err(RunnerError::InvalidSpec(
-            "container command and arguments cannot contain NUL".into(),
-        ));
-    }
+        .try_for_each(|value| validate_process_word(value))
+        .map_err(RunnerError::InvalidSpec)?;
 
-    for entry in task_env
+    for (name, value) in task_env
         .into_iter()
         .map(|entry| (entry.key(), entry.value()))
         .chain(
@@ -216,17 +203,8 @@ fn validate_process_input(
                 .map(|entry| (entry.key(), entry.value())),
         )
     {
-        let (name, value) = entry;
-        if name.is_empty() || name.contains(['=', '\0']) {
-            return Err(RunnerError::InvalidSpec(format!(
-                "invalid container environment variable name {name:?}"
-            )));
-        }
-        if value.contains('\0') {
-            return Err(RunnerError::InvalidSpec(format!(
-                "container environment variable {name:?} contains NUL"
-            )));
-        }
+        validate_env_name(name).map_err(RunnerError::InvalidSpec)?;
+        validate_env_value(name, value).map_err(RunnerError::InvalidSpec)?;
     }
     Ok(())
 }

@@ -22,7 +22,6 @@ solti = { version = "0.0", features = ["api-core-adapter", "api-http", "chain", 
 
 The `model` feature exposes runtime model types without JSON Schema dependencies.
 Enable `model-schema` when the application generates schemas for those types.
-The `chain-schema` feature adds schemas for Chain and its nested model types.
 
 The `cron` feature exposes `solti::cron` for IANA timezone schedules and recurring Taskvisor tasks.
 Its invocation timeout is separate from the outer registration lifetime; see the [calendar guide](../../docs/cron-scheduling.md).
@@ -89,7 +88,7 @@ Then inspect an application-defined workload:
 
 ```bash
 cargo run -p solti --example task_custom_workload \
-  --features core
+  --features core,model-schema
 ```
 
 Run the native containerd 2.x path on Linux:

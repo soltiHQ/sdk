@@ -21,8 +21,8 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::config::DiscoverConfig;
 use crate::errors::DiscoverError;
-use crate::proto::SyncRequest;
 use crate::proto::discover_service_client::DiscoverServiceClient;
+use crate::proto::{SyncRequest, SyncResponse};
 use crate::tasks::transport::{validate_response, validate_token_transport};
 
 /// gRPC discovery adapter.
@@ -93,7 +93,7 @@ impl GrpcAdapter {
     }
 
     /// Sends one discovery request.
-    pub(super) async fn sync(&self, request: SyncRequest) -> Result<(), DiscoverError> {
+    pub(super) async fn sync(&self, request: SyncRequest) -> Result<SyncResponse, DiscoverError> {
         let client = self
             .client
             .get_or_try_init(|| async {
@@ -121,6 +121,11 @@ impl GrpcAdapter {
             }),
             Err(status) => Err(DiscoverError::from(status)),
         }
+    }
+
+    /// Returns the size of the protobuf message `sync` sends for `request`.
+    pub(super) fn encoded_len(&self, request: &SyncRequest) -> usize {
+        prost::Message::encoded_len(request)
     }
 
     /// Returns whether the endpoint uses HTTPS.
@@ -214,25 +219,31 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     messages.join(": ")
 }
 
+/// The gRPC front of the test control plane.
 #[cfg(test)]
-mod tests {
+pub(super) mod fake {
     use std::convert::Infallible;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
-    use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
     use tonic::codegen::{Body, BoxFuture, Service, StdError, http};
     use tonic::server::{NamedService, UnaryService};
-    use tonic::transport::server::TcpIncoming;
 
-    use super::*;
+    use crate::proto::SyncRequest;
+    use crate::tasks::transport::fake::{FakeControlPlane, Outcome};
 
+    /// `DiscoverService.Sync` answered by a [`FakeControlPlane`], for any number
+    /// of requests.
+    ///
+    /// With `expected_authorization`, a call without that bearer metadata is
+    /// `Unauthenticated`. A call for another agent than `agent-1` is
+    /// `InvalidArgument`.
     #[derive(Clone)]
-    struct TestDiscoverServer {
-        expected_authorization: &'static str,
-        calls: Arc<AtomicUsize>,
+    pub(super) struct TestDiscoverServer {
+        pub(super) expected_authorization: Option<&'static str>,
+        pub(super) calls: Arc<AtomicUsize>,
+        pub(super) control: Arc<FakeControlPlane>,
     }
 
     impl<B> Service<http::Request<B>> for TestDiscoverServer
@@ -265,8 +276,9 @@ mod tests {
             }
 
             struct SyncService {
-                expected_authorization: &'static str,
+                expected_authorization: Option<&'static str>,
                 calls: Arc<AtomicUsize>,
+                control: Arc<FakeControlPlane>,
             }
 
             impl UnaryService<SyncRequest> for SyncService {
@@ -276,24 +288,39 @@ mod tests {
                 fn call(&mut self, request: tonic::Request<SyncRequest>) -> Self::Future {
                     let expected_authorization = self.expected_authorization;
                     let calls = Arc::clone(&self.calls);
+                    let control = Arc::clone(&self.control);
                     Box::pin(async move {
                         calls.fetch_add(1, Ordering::SeqCst);
-                        let authorization = request
-                            .metadata()
-                            .get("authorization")
-                            .and_then(|value| value.to_str().ok());
-                        if authorization != Some(expected_authorization) {
-                            return Err(tonic::Status::unauthenticated("invalid bearer token"));
+                        if let Some(expected_authorization) = expected_authorization {
+                            let authorization = request
+                                .metadata()
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok());
+                            if authorization != Some(expected_authorization) {
+                                return Err(tonic::Status::unauthenticated("invalid bearer token"));
+                            }
                         }
                         if request.get_ref().id != "agent-1" {
                             return Err(tonic::Status::invalid_argument("unexpected agent id"));
                         }
 
-                        Ok(tonic::Response::new(crate::proto::SyncResponse {
-                            success: true,
-                            reason: String::new(),
-                            retry_after_s: 0,
-                        }))
+                        let bytes = prost::Message::encoded_len(request.get_ref());
+                        match control.answer(request.get_ref(), bytes) {
+                            Outcome::Accepted(want_schemas) => {
+                                Ok(tonic::Response::new(crate::proto::SyncResponse {
+                                    success: true,
+                                    reason: String::new(),
+                                    retry_after_s: 0,
+                                    want_schemas,
+                                }))
+                            }
+                            Outcome::TooLarge => Err(tonic::Status::resource_exhausted(
+                                "discovery request too large",
+                            )),
+                            Outcome::Unavailable => {
+                                Err(tonic::Status::unavailable("control plane unavailable"))
+                            }
+                        }
                     })
                 }
             }
@@ -301,6 +328,7 @@ mod tests {
             let service = SyncService {
                 expected_authorization: self.expected_authorization,
                 calls: Arc::clone(&self.calls),
+                control: Arc::clone(&self.control),
             };
             Box::pin(async move {
                 let codec = tonic_prost::ProstCodec::default();
@@ -313,6 +341,23 @@ mod tests {
     impl NamedService for TestDiscoverServer {
         const NAME: &'static str = "solti.discover.v1.DiscoverService";
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tonic::codegen::{Body, BoxFuture, Service, StdError, http};
+    use tonic::server::NamedService;
+    use tonic::transport::server::TcpIncoming;
+
+    use super::fake::TestDiscoverServer;
+    use super::*;
 
     async fn spawn_test_server(
         expected_authorization: &'static str,
@@ -328,8 +373,9 @@ mod tests {
         let address = listener.local_addr().expect("read discovery address");
         let calls = Arc::new(AtomicUsize::new(0));
         let service = TestDiscoverServer {
-            expected_authorization,
+            expected_authorization: Some(expected_authorization),
             calls: Arc::clone(&calls),
+            control: Arc::default(),
         };
         let incoming = TcpIncoming::from(listener);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();

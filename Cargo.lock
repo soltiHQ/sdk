@@ -601,9 +601,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -1774,9 +1774,9 @@ checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.13.4"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
 dependencies = [
  "bitflags",
  "memchr",
@@ -2037,9 +2037,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -2100,9 +2100,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "e3a0760a887c14823fca5a1c970b01d47c328c696c0c64829d1df50e8f853fd5"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -2120,6 +2120,12 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
 
 [[package]]
 name = "same-file"
@@ -2264,6 +2270,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json_canonicalizer"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87f7bb64f8c7e9f783fdfe883b5fe93a90bee1597c63705baa91842c5f698620"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "serde_path_to_error"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2381,9 +2398,10 @@ dependencies = [
 
 [[package]]
 name = "solti"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "rcgen",
+ "schemars",
  "serde",
  "serde_json",
  "solti-api",
@@ -2401,11 +2419,12 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "solti-api"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "aide",
  "async-trait",
@@ -2440,7 +2459,7 @@ dependencies = [
 
 [[package]]
 name = "solti-chain"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "bytes",
  "jsonschema",
@@ -2457,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "solti-core"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "bytes",
  "parking_lot",
@@ -2476,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "solti-cron"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2488,8 +2507,9 @@ dependencies = [
 
 [[package]]
 name = "solti-discover"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
+ "axum",
  "http-body-util",
  "pbjson",
  "pbjson-build",
@@ -2499,6 +2519,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "solti-model",
  "solti-tls",
  "taskvisor",
@@ -2516,6 +2537,7 @@ name = "solti-docs-tests"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "schemars",
  "serde",
  "serde_json",
  "solti",
@@ -2537,17 +2559,19 @@ dependencies = [
 
 [[package]]
 name = "solti-exec"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bytes",
  "containerd-client",
  "getrandom 0.4.3",
+ "jsonschema",
  "libc",
  "oci-spec",
  "prost",
  "prost-types",
+ "schemars",
  "seccompiler",
  "serde",
  "serde_json",
@@ -2564,7 +2588,7 @@ dependencies = [
 
 [[package]]
 name = "solti-model"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2573,6 +2597,9 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
+ "serde_path_to_error",
+ "sha2",
  "subtle",
  "thiserror 2.0.20",
  "time",
@@ -2580,7 +2607,7 @@ dependencies = [
 
 [[package]]
 name = "solti-observe"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -2596,7 +2623,7 @@ dependencies = [
 
 [[package]]
 name = "solti-prometheus"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "axum",
  "itoa",
@@ -2615,11 +2642,12 @@ dependencies = [
 
 [[package]]
 name = "solti-runner"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "async-trait",
  "bytes",
  "proptest",
+ "schemars",
  "serde",
  "serde_json",
  "solti-model",
@@ -2632,7 +2660,7 @@ dependencies = [
 
 [[package]]
 name = "solti-tls"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "rcgen",
  "rustls",
@@ -3220,9 +3248,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -3365,9 +3393,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "293198dcebfb821155b5092ab94b5a82ff180eddd7241df3bd6e66a4ffd1a585"
 dependencies = [
  "rustls-pki-types",
 ]

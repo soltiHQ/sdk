@@ -21,12 +21,13 @@
 
 use std::sync::{Arc, Mutex};
 
+use solti_exec::container::ContainerSpec;
 use solti_exec::container::containerd::{ContainerNetwork, ContainerdConfig, ContainerdEngine};
 use solti_exec::container::{
     ContainerProcessPolicy, ContainerRunnerConfig, register_container_runner_with_config,
 };
 use solti_exec::isolation::SeccompPolicy;
-use solti_model::{ContainerSpec, OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
+use solti_model::{OutputEvent, Task, TaskEnv, TaskId, TaskSpec, TaskWorkload};
 use solti_runner::{OutputPublisher, OutputPublisherHandle, OutputSink, RunnerRouter};
 use taskvisor::TaskContext;
 
@@ -158,12 +159,12 @@ async fn main() -> ExampleResult {
     env.push("EXAMPLE_MESSAGE", "hello from solti container");
     let shell = r#"printf 'message=%s\n' "$EXAMPLE_MESSAGE"
 printf 'diagnostic=container-stderr\n' >&2"#;
-    let workload = TaskWorkload::Container(ContainerSpec::new(
+    let workload = TaskWorkload::from_body(&ContainerSpec::new(
         image,
         Some(vec!["/bin/sh".into()]),
         vec!["-c".into(), shell.into()],
         env,
-    ));
+    ))?;
     let spec = TaskSpec::builder("containers", workload, 120_000_u64).build()?;
     let task = Task::new("native-container", spec)?;
 

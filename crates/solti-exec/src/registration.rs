@@ -24,3 +24,37 @@ pub(crate) fn validate_runner_name(name: &str) -> Result<(), crate::ExecError> {
         )))
     }
 }
+
+/// Prefixes a body check's refusal with the path of the offending field below `spec`, as
+/// `spec.<path>: <reason>`.
+pub(crate) fn at_field(
+    path: impl std::fmt::Display,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    result.map_err(|reason| format!("spec.{path}: {reason}"))
+}
+
+/// Decodes the body of the workload a runner is asked to build.
+///
+/// A workload of another type, or an embedded one, is [`solti_runner::RunnerError::UnsupportedWorkload`].
+/// A body of this runner's type that does not decode or validate is [`solti_runner::RunnerError::InvalidSpec`].
+pub(crate) fn decode_workload<B: solti_model::WorkloadBody>(
+    runner: &str,
+    workload: &solti_model::TaskWorkload,
+) -> Result<B, solti_runner::RunnerError> {
+    use solti_model::{TaskWorkload, WorkloadBodyErrorKind};
+    use solti_runner::RunnerError;
+
+    let unsupported = |workload: &TaskWorkload| RunnerError::UnsupportedWorkload {
+        runner: runner.to_owned(),
+        api_version: workload.api_version().to_owned(),
+        kind: workload.kind().to_owned(),
+    };
+    match workload {
+        TaskWorkload::Routed(routed) => routed.decode::<B>().map_err(|error| match error.kind() {
+            WorkloadBodyErrorKind::TypeMismatch { .. } => unsupported(workload),
+            _ => RunnerError::InvalidSpec(error.to_string()),
+        }),
+        other => Err(unsupported(other)),
+    }
+}

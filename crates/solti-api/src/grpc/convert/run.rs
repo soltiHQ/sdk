@@ -125,7 +125,7 @@ fn runs_page_to_proto_with_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solti_model::{TaskId, TaskPhase, Uid, WORKLOAD_API_VERSION, WorkloadTypeMeta};
+    use solti_model::{EMBEDDED_WORKLOAD_API_VERSION, TaskId, TaskPhase, Uid, WorkloadTypeMeta};
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn run_active_has_no_finished_timestamp() {
-        let workload = WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap();
+        let workload = WorkloadTypeMeta::new("exec.solti.io/v1", "Subprocess").unwrap();
         let run = TaskRun::starting(1, 1, workload).unwrap();
         let proto = proto_api::TaskRunInfo::try_from(run).unwrap();
         assert_eq!(proto.finished_at, None);
@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn embedded_run_is_not_exposed() {
-        let workload = WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Embedded").unwrap();
+        let workload = WorkloadTypeMeta::new(EMBEDDED_WORKLOAD_API_VERSION, "Embedded").unwrap();
         let run = TaskRun::starting(1, 1, workload).unwrap();
 
         let error = proto_api::TaskRunInfo::try_from(run).unwrap_err();
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn run_list_stops_at_the_exact_protobuf_boundary() {
-        let workload = WorkloadTypeMeta::new(WORKLOAD_API_VERSION, "Subprocess").unwrap();
+        let workload = WorkloadTypeMeta::new("exec.solti.io/v1", "Subprocess").unwrap();
         let page = TaskRunPage {
             items: vec![
                 TaskRun::starting(1, 1, workload.clone()).unwrap(),

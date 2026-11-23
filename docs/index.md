@@ -23,7 +23,8 @@ Use the [architecture map](architecture.md) to locate a responsibility and the
 | Understand desired state and execute one local task | [Quick start](quick-start.md), [mental model](mental-model.md) | `solti-model`, `solti-core`, Taskvisor |
 | Assemble a service that owns execution and shutdown | [Build an agent](building-an-agent.md) | Application, runner, core, optional API and operations |
 | Run a command or script | [Subprocesses](subprocesses.md) | Model, runner, exec, core |
-| Supply a custom workload or execution backend | [Routing and custom runners](routing-and-custom-runners.md) | Model, runner, application |
+| Declare a workload type, supply a custom backend, or route work | [Routing and custom runners](routing-and-custom-runners.md) | Model, runner, application |
+| Upgrade from 0.0.8 | [Migrating from 0.0.8 to 0.0.9](migrating-from-0-0.md) | Model, runner, exec, chain, API |
 | Run a native container or configure host controls | [Containers and isolation](containers-and-isolation.md) | Model, exec, external runtime or host |
 | Run work on an IANA timezone calendar | [Calendar scheduling](cron-scheduling.md) | Cron, Taskvisor, optional core |
 | Compose conditional sequential work | [Chains](chains.md) | Chain, runner catalog, execution backends, core |

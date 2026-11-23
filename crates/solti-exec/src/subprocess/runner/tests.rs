@@ -1,5 +1,6 @@
 use super::*;
 use crate::output::OutputReaderFailure;
+use solti_model::TaskWorkload;
 use std::{
     pin::Pin,
     sync::Mutex,
@@ -641,15 +642,16 @@ fn mk_command_spec(
 ) -> Task {
     let spec = solti_model::TaskSpec::builder(
         slot,
-        TaskWorkload::Subprocess(SubprocessSpec::new(
-            solti_model::SubprocessMode::Command {
+        TaskWorkload::from_body(&SubprocessSpec::new(
+            SubprocessMode::Command {
                 command: command.into(),
                 args: args.iter().map(|s| s.to_string()).collect(),
             },
             env,
             cwd,
             Default::default(),
-        )),
+        ))
+        .unwrap(),
         5_000u64,
     )
     .restart(solti_model::RestartPolicy::Never)
@@ -675,8 +677,8 @@ fn mk_script_spec_with_interpreter(
 
     let spec = solti_model::TaskSpec::builder(
         slot,
-        TaskWorkload::Subprocess(SubprocessSpec::new(
-            solti_model::SubprocessMode::Script {
+        TaskWorkload::from_body(&SubprocessSpec::new(
+            SubprocessMode::Script {
                 interpreter: interpreter.into(),
                 body: BASE64.encode(body),
                 args: args.iter().map(|s| s.to_string()).collect(),
@@ -684,7 +686,8 @@ fn mk_script_spec_with_interpreter(
             Default::default(),
             None,
             Default::default(),
-        )),
+        ))
+        .unwrap(),
         5_000u64,
     )
     .restart(solti_model::RestartPolicy::Never)
@@ -738,15 +741,16 @@ fn cwd_pinning_does_not_use_tokio_blocking_workers() {
             let directory = tempfile::TempDir::new().unwrap();
             let spec = solti_model::TaskSpec::builder(
                 "dedicated-cwd",
-                TaskWorkload::Subprocess(SubprocessSpec::new(
-                    solti_model::SubprocessMode::Command {
+                TaskWorkload::from_body(&SubprocessSpec::new(
+                    SubprocessMode::Command {
                         command: "true".into(),
                         args: Vec::new(),
                     },
                     Default::default(),
                     Some(directory.path().to_path_buf()),
                     Default::default(),
-                )),
+                ))
+                .unwrap(),
                 5_000_u64,
             )
             .build()
@@ -1494,15 +1498,16 @@ async fn tracing_does_not_record_subprocess_process_inputs() {
 
     let spec = solti_model::TaskSpec::builder(
         "trace-secret",
-        TaskWorkload::Subprocess(SubprocessSpec::new(
-            solti_model::SubprocessMode::Command {
+        TaskWorkload::from_body(&SubprocessSpec::new(
+            SubprocessMode::Command {
                 command: format!("https://user:{COMMAND_SECRET}@host.invalid/tool\n{FORGED}"),
                 args: vec![format!("--token={ARG_SECRET}")],
             },
             solti_model::TaskEnv::single("SECRET_TOKEN", ENV_SECRET),
             None,
             Default::default(),
-        )),
+        ))
+        .unwrap(),
         5_000u64,
     )
     .restart(solti_model::RestartPolicy::Never)
@@ -1551,16 +1556,6 @@ async fn build_task_rejects_non_subprocess_kind() {
         Err(other) => panic!("expected UnsupportedWorkload, got {other:?}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
-}
-
-#[test]
-fn workload_types_declares_subprocess() {
-    let runner = SubprocessRunner::new("test").unwrap();
-    let task = mk_subprocess_spec("s", "echo");
-    assert_eq!(
-        runner.workload_types(),
-        vec![task.spec().workload().type_meta()]
-    );
 }
 
 #[tokio::test]
@@ -1873,11 +1868,12 @@ async fn script_task_can_be_spawned_repeatedly() {
 
 #[test]
 fn resolve_mode_command() {
-    let mode = solti_model::SubprocessMode::Command {
+    let mode = SubprocessMode::Command {
         command: "ls".into(),
         args: vec!["-la".into()],
     };
-    let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
+    let r =
+        SubprocessRunner::resolve_mode(&mode, crate::subprocess::MAX_SCRIPT_BODY_BYTES).unwrap();
     assert_eq!(r.command, "ls");
     assert_eq!(r.args, vec!["-la"]);
     assert!(r.script_body.is_none(), "Command mode carries no script");
@@ -1888,12 +1884,13 @@ fn resolve_mode_script_defers_transport_to_run_time() {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
-    let mode = solti_model::SubprocessMode::Script {
+    let mode = SubprocessMode::Script {
         interpreter: "bash".into(),
         body: BASE64.encode(b"echo hello"),
         args: vec!["extra".into()],
     };
-    let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
+    let r =
+        SubprocessRunner::resolve_mode(&mode, crate::subprocess::MAX_SCRIPT_BODY_BYTES).unwrap();
     assert_eq!(r.command, "bash");
     assert_eq!(
         r.args,
@@ -1910,12 +1907,13 @@ fn resolve_mode_script_uses_explicit_interpreter() {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
-    let mode = solti_model::SubprocessMode::Script {
+    let mode = SubprocessMode::Script {
         interpreter: "ruby".into(),
         body: BASE64.encode(b"puts 'hi'"),
         args: vec![],
     };
-    let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap();
+    let r =
+        SubprocessRunner::resolve_mode(&mode, crate::subprocess::MAX_SCRIPT_BODY_BYTES).unwrap();
     assert_eq!(r.command, "ruby");
     assert!(r.args.is_empty());
     assert!(r.script_body.is_some());
@@ -2107,13 +2105,13 @@ async fn force_aborting_outer_attempt_aborts_blocked_readers_and_closes_pipe_end
 
 #[test]
 fn resolve_mode_invalid_base64() {
-    let mode = solti_model::SubprocessMode::Script {
+    let mode = SubprocessMode::Script {
         interpreter: "bash".into(),
         body: "not-valid!!!".into(),
         args: vec![],
     };
-    let err =
-        SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES).unwrap_err();
+    let err = SubprocessRunner::resolve_mode(&mode, crate::subprocess::MAX_SCRIPT_BODY_BYTES)
+        .unwrap_err();
     assert!(matches!(err, RunnerError::InvalidSpec(_)));
 }
 
@@ -2247,12 +2245,12 @@ fn resolve_mode_script_accepts_large_body() {
         .copied()
         .chain(std::iter::repeat_n(b'x', 200 * 1024))
         .collect();
-    let mode = solti_model::SubprocessMode::Script {
+    let mode = SubprocessMode::Script {
         interpreter: "bash".into(),
         body: BASE64.encode(&payload),
         args: vec![],
     };
-    let r = SubprocessRunner::resolve_mode(&mode, solti_model::MAX_SCRIPT_BODY_BYTES)
+    let r = SubprocessRunner::resolve_mode(&mode, crate::subprocess::MAX_SCRIPT_BODY_BYTES)
         .expect("200 KiB script must resolve via descriptor transport");
     assert_eq!(r.command, "bash");
     assert!(r.args.is_empty());
@@ -2267,7 +2265,7 @@ fn resolve_mode_rejects_body_over_configured_limit() {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
-    let mode = solti_model::SubprocessMode::Script {
+    let mode = SubprocessMode::Script {
         interpreter: "bash".into(),
         body: BASE64.encode("a".repeat(100).as_bytes()),
         args: vec![],
