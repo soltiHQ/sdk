@@ -55,6 +55,7 @@ impl GrpcAdapter {
         }
         let secure = scheme == Some("https");
 
+        #[cfg(feature = "tls")]
         {
             if config.tls.is_some() && !secure {
                 return Err(DiscoverError::InvalidConfig(
@@ -72,6 +73,7 @@ impl GrpcAdapter {
             }
         }
 
+        #[cfg(not(feature = "tls"))]
         if secure {
             return Err(DiscoverError::InvalidConfig(
                 "https gRPC discovery requires the tls feature".into(),

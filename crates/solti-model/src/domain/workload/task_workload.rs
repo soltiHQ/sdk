@@ -138,6 +138,7 @@ pub struct Workload {
         schemars(schema_with = "crate::schema::routed_api_version")
     )]
     api_version: String,
+    #[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::crd_kind"))]
     kind: String,
     #[cfg_attr(
         feature = "schema",

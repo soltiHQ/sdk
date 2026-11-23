@@ -38,7 +38,9 @@ use http::HttpAdapter;
 
 /// Selected transport for one discovery task.
 pub(super) enum TransportAdapter {
+    #[cfg(feature = "grpc")]
     Grpc(Box<GrpcAdapter>),
+    #[cfg(feature = "http")]
     Http(HttpAdapter),
 }
 
@@ -46,7 +48,9 @@ impl TransportAdapter {
     /// Creates only the adapter selected by the config.
     pub(super) fn from_config(config: &DiscoverConfig) -> Result<Self, DiscoverError> {
         match config.control_plane.transport {
+            #[cfg(feature = "grpc")]
             DiscoveryTransport::Grpc => GrpcAdapter::new(config).map(Box::new).map(Self::Grpc),
+            #[cfg(feature = "http")]
             DiscoveryTransport::Http => HttpAdapter::new(config).map(Self::Http),
         }
     }
@@ -56,7 +60,9 @@ impl TransportAdapter {
     /// Returns the accepted response, `want_schemas` included.
     pub(super) async fn sync(&self, request: SyncRequest) -> Result<SyncResponse, DiscoverError> {
         match self {
+            #[cfg(feature = "grpc")]
             Self::Grpc(adapter) => adapter.sync(request).await,
+            #[cfg(feature = "http")]
             Self::Http(adapter) => adapter.sync(request).await,
         }
     }
@@ -66,7 +72,9 @@ impl TransportAdapter {
     /// This is the size the control plane's request limit counts.
     pub(super) fn encoded_len(&self, request: &SyncRequest) -> usize {
         match self {
+            #[cfg(feature = "grpc")]
             Self::Grpc(adapter) => adapter.encoded_len(request),
+            #[cfg(feature = "http")]
             Self::Http(adapter) => adapter.encoded_len(request),
         }
     }
@@ -74,7 +82,9 @@ impl TransportAdapter {
     /// Returns whether the selected endpoint uses TLS.
     pub(super) fn is_secure(&self) -> bool {
         match self {
+            #[cfg(feature = "grpc")]
             Self::Grpc(adapter) => adapter.is_secure(),
+            #[cfg(feature = "http")]
             Self::Http(adapter) => adapter.is_secure(),
         }
     }
@@ -118,7 +128,7 @@ fn validate_response(response: SyncResponse) -> Result<SyncResponse, DiscoverErr
 ///
 /// [`FakeControlPlane`](fake::FakeControlPlane) holds the state; the HTTP and
 /// gRPC fakes serve it on a loopback port.
-#[cfg(test)]
+#[cfg(all(test, feature = "grpc"))]
 pub(in crate::tasks) mod fake {
     use std::collections::{BTreeMap, BTreeSet};
 

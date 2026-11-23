@@ -551,6 +551,7 @@ fn classify_failure(err: &DiscoverError) -> metrics::DiscoverFailReason {
         }
         DiscoverError::Rejected { .. } => metrics::DiscoverFailReason::RejectedClient,
         DiscoverError::AuthFailed { .. } => metrics::DiscoverFailReason::Auth,
+        #[cfg(feature = "http")]
         DiscoverError::HttpRequest(e) => {
             if e.is_timeout() {
                 metrics::DiscoverFailReason::Timeout
@@ -562,6 +563,7 @@ fn classify_failure(err: &DiscoverError) -> metrics::DiscoverFailReason {
                 metrics::DiscoverFailReason::Other
             }
         }
+        #[cfg(feature = "http")]
         DiscoverError::HttpStatus { code, .. } => {
             if *code >= 500 {
                 metrics::DiscoverFailReason::RejectedServer
@@ -569,8 +571,11 @@ fn classify_failure(err: &DiscoverError) -> metrics::DiscoverFailReason {
                 metrics::DiscoverFailReason::RejectedClient
             }
         }
+        #[cfg(feature = "http")]
         DiscoverError::InvalidResponse(_) => metrics::DiscoverFailReason::Parse,
+        #[cfg(feature = "grpc")]
         DiscoverError::GrpcTransport(_) => metrics::DiscoverFailReason::Connect,
+        #[cfg(feature = "grpc")]
         DiscoverError::GrpcStatus(s) => {
             use tonic::Code;
             match s.code() {
@@ -610,6 +615,7 @@ fn arch() -> &'static str {
 /// Linux uses `PRETTY_NAME` from `/etc/os-release` when available.
 /// It falls back to `/usr/lib/os-release`, then the Rust platform name.
 fn os_info() -> String {
+    #[cfg(target_os = "linux")]
     {
         for path in ["/etc/os-release", "/usr/lib/os-release"] {
             if let Ok(content) = std::fs::read_to_string(path) {
@@ -734,8 +740,6 @@ fn clamp_retry_after_s(seconds: i32) -> i32 {
 mod tests {
     use super::*;
     use solti_model::{Labels, RunnerCapability};
-
-    use std::sync::atomic::AtomicUsize;
 
     use crate::tasks::schemas::fixtures::{small_schema, workload};
 
@@ -926,6 +930,8 @@ mod tests {
     #[cfg(feature = "http")]
     #[tokio::test]
     async fn local_wire_stamp_failure_records_no_transport_metrics() {
+        use std::sync::atomic::AtomicUsize;
+
         #[derive(Debug, Default)]
         struct MetricsProbe {
             attempts: AtomicUsize,

@@ -44,6 +44,7 @@ impl HttpAdapter {
         let url = sync_url(&config.control_plane.address)?;
         let secure = url.scheme() == "https";
 
+        #[cfg(feature = "tls")]
         if config.tls.is_some() && !secure {
             return Err(DiscoverError::InvalidConfig(
                 "custom TLS requires an https control-plane endpoint".into(),
@@ -158,6 +159,7 @@ fn build_client(config: &DiscoverConfig) -> Result<reqwest::Client, DiscoverErro
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(USER_AGENT);
 
+    #[cfg(feature = "tls")]
     if let Some(tls) = &config.tls {
         let mut rustls_config = tls
             .clone()
