@@ -1411,14 +1411,6 @@ mod tests {
         const KIND: &'static str = "Resize";
     }
 
-    fn lookahead_schema() -> Value {
-        json!({
-            "$schema": WORKLOAD_SCHEMA_DIALECT,
-            "type": "object",
-            "properties": { "text": { "type": "string", "pattern": "^(?=a)b$" } },
-        })
-    }
-
     #[test]
     fn registration_snapshots_declared_types_with_fingerprints() {
         let mut router = RunnerRouter::new();
@@ -1449,35 +1441,8 @@ mod tests {
     #[test]
     fn registration_refuses_an_unusable_declaration() {
         let mut router = RunnerRouter::new();
-        let bad_schema = WorkloadDecl::new(EXAMPLE, "Lookahead", &lookahead_schema(), |_| Ok(()));
         let reserved = decl("solti.io/v1", "Embedded");
         let bad_gvk = decl("not a gvk", "Kind");
-
-        let error = router
-            .register(Arc::new(DeclaredRunner {
-                name: "lookahead",
-                workload_types: vec![decl(EXAMPLE, "Fine"), bad_schema],
-            }))
-            .unwrap_err();
-        let RouterError::InvalidWorkloadType {
-            runner,
-            api_version,
-            kind,
-            reason,
-        } = &error
-        else {
-            panic!("expected InvalidWorkloadType, got {error:?}");
-        };
-        assert_eq!(runner, "lookahead");
-        assert_eq!(api_version, EXAMPLE);
-        assert_eq!(kind, "Lookahead");
-        assert!(reason.contains("#/properties/text"), "{reason}");
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "runner 'lookahead' declares {EXAMPLE}/Lookahead with an unusable declaration: {reason}"
-            )
-        );
 
         for (name, unusable, needle) in [
             ("reserved", reserved, "reserved"),

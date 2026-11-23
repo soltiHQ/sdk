@@ -2594,7 +2594,6 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "jsonschema",
- "regex-syntax",
  "schemars",
  "serde",
  "serde_json",

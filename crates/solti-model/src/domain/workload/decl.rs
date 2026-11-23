@@ -338,17 +338,6 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
-    struct Lookahead {
-        #[schemars(regex(pattern = "^(?=a)b$"))]
-        text: String,
-    }
-
-    impl crate::WorkloadBody for Lookahead {
-        const API_VERSION: &'static str = "tasks.example.io/v1";
-        const KIND: &'static str = "Lookahead";
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
     struct Reserved {}
 
     impl crate::WorkloadBody for Reserved {
@@ -426,12 +415,6 @@ mod tests {
 
     #[test]
     fn decl_keeps_errors_for_registration() {
-        let lookahead = WorkloadDecl::of::<Lookahead>();
-        let error = lookahead.workload_type().unwrap_err();
-        assert_eq!(error.api_version(), "tasks.example.io/v1");
-        assert_eq!(error.kind(), "Lookahead");
-        assert!(error.reason().contains("#/properties/text"), "{error}");
-
         let reserved = WorkloadDecl::of::<Reserved>();
         let error = reserved.workload_type().unwrap_err();
         assert!(error.reason().contains("reserved"), "{error}");

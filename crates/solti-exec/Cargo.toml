@@ -133,10 +133,6 @@ name              = "subprocess_script"
 required-features = ["subprocess"]
 
 [[test]]
-name              = "builtin_schemas"
-required-features = ["subprocess", "container"]
-
-[[test]]
 name              = "linux_host_runtime"
 required-features = ["subprocess", "seccomp"]
 
