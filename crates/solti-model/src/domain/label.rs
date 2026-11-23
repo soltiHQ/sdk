@@ -29,6 +29,10 @@ use crate::{ModelResult, validation};
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schema", schemars(schema_with = "crate::schema::labels"))]
+#[cfg_attr(
+    feature = "schema",
+    schemars(description = "Structured key-value metadata.")
+)]
 #[serde(transparent)]
 pub struct Labels(BTreeMap<String, String>);
 

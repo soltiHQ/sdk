@@ -85,6 +85,9 @@ fn decode_script_body(body: &str, max_bytes: usize) -> ModelResult<Vec<u8>> {
 /// assert_eq!(mode.decode_body().unwrap(), "echo hello");
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(
+    description = "Execution strategy for a subprocess task: command runs an executable with arguments; script runs a base64 body through an interpreter with arguments."
+)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SubprocessMode {
@@ -229,6 +232,9 @@ impl SubprocessMode {
 ///
 /// Common fields (`env`, `cwd`, `fail_on_non_zero`) apply to both modes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(
+    description = "Specification for subprocess execution on the host, in command or script mode. env, cwd and failOnNonZero apply to both modes."
+)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SubprocessSpec {
@@ -240,6 +246,7 @@ pub struct SubprocessSpec {
     /// Working directory.
     ///
     /// A validated task spec requires this wire-facing path to be valid UTF-8.
+    #[schemars(description = "Working directory.")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     /// Whether to treat non-zero exit codes as task failure.

@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "schema",
+    schemars(description = "Key-value pair used for environment variables or generic metadata.")
+)]
 #[serde(deny_unknown_fields)]
 pub struct KeyValue {
     /// Name of the variable or key.

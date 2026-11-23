@@ -12,9 +12,9 @@ macro_rules! env_newtype {
         $(#[$meta:meta])*
         $vis:vis struct $ty:ident;
     ) => {
-        $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
         #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+        $(#[$meta])*
         #[serde(transparent)]
         $vis struct $ty(Vec<$crate::KeyValue>);
 

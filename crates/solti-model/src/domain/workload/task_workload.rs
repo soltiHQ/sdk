@@ -125,6 +125,12 @@ impl EmbeddedSpec {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[cfg_attr(
+    feature = "schema",
+    schemars(
+        description = "GVK envelope of a routed workload. spec is a JSON object owned by the application; the solti.io group is reserved for SDK-internal workloads."
+    )
+)]
 #[serde(rename_all = "camelCase")]
 pub struct Workload {
     #[cfg_attr(

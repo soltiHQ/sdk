@@ -20,6 +20,9 @@ pub const CHAIN_KIND: &str = "Chain";
 #[derive(
     Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema,
 )]
+#[schemars(
+    description = "Failure-state behavior after following an onFailure transition. Omitting mode means preserve."
+)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum FailureMode {
@@ -73,6 +76,7 @@ impl FailureTransition {
 /// One executable step in a [`ChainSpec`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[schemars(!try_from, deny_unknown_fields)]
+#[schemars(description = "One executable step in a chain.")]
 #[serde(rename_all = "camelCase", try_from = "raw::ChainStepRaw")]
 pub struct ChainStep {
     name: TaskId,

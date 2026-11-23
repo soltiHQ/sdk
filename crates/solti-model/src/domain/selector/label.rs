@@ -38,6 +38,12 @@ use crate::{Labels, ModelError, ModelResult};
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "schema",
+    schemars(
+        description = "Label selector for matching any labeled object. matchLabels and matchExpressions are ANDed together; an empty selector matches every label set."
+    )
+)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LabelSelector {
     /// Exact key-value matches.
