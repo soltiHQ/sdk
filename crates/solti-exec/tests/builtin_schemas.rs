@@ -1,12 +1,8 @@
 #![cfg(all(feature = "subprocess", feature = "container"))]
-//! The built-in `exec.solti.io/v1` schemas, pinned as snapshots and checked by Podium.
+//! The built-in `exec.solti.io/v1` schemas, pinned as snapshots.
 //!
 //! `tests/schemas/<group>-<version>-<kind>.json` holds the canonical bytes a runner's declaration
-//! sends in discovery. Podium's own compiler wrote its verdict next to each, in `*.podium.json`,
-//! through the vector runner. A refused built-in is a bug, never a snapshot to keep.
-//!
-//! After a type change, run the ignored `update_schema_snapshots` (it rewrites the snapshots and
-//! deletes their sidecars), then the runner again.
+//! sends in discovery. After a type change, run the ignored `update_schema_snapshots`.
 
 use std::{fs, path::PathBuf};
 
@@ -61,7 +57,7 @@ fn the_declarations_are_the_exec_types() {
 }
 
 #[test]
-fn snapshots_equal_what_discovery_sends_and_podium_accepts_them() {
+fn snapshots_equal_what_discovery_sends() {
     for (stem, decl) in declarations() {
         let schema = sent(&decl);
         let snapshot = fs::read(dir().join(format!("{stem}.json")))
@@ -69,22 +65,6 @@ fn snapshots_equal_what_discovery_sends_and_podium_accepts_them() {
         assert!(
             snapshot == schema.canonical_json(),
             "{stem}.json differs from the declared schema: run update_schema_snapshots"
-        );
-        let sidecar: Value = serde_json::from_slice(
-            &fs::read(dir().join(format!("{stem}.podium.json")))
-                .unwrap_or_else(|_| panic!("{stem}.podium.json is missing: run the vector runner")),
-        )
-        .expect("the sidecar is JSON");
-        assert_eq!(
-            sidecar["fingerprint"].as_str(),
-            Some(schema.fingerprint().as_str()),
-            "{stem}: the sidecar's fingerprint is stale"
-        );
-        assert_eq!(
-            sidecar["podium"]["compile"].as_str(),
-            Some("ok"),
-            "{stem}: Podium refuses it: {}",
-            sidecar["podium"]["error"]
         );
     }
 }
@@ -173,9 +153,9 @@ fn valid_bodies_validate_against_the_schemas_their_declarations_emit() {
     assert_valid(&container, json!({"image": "redis:7", "command": null}));
 }
 
-/// Rewrites the snapshots and deletes their sidecars.
+/// Rewrites the snapshots.
 #[test]
-#[ignore = "rewrites tests/schemas; then run the vector runner"]
+#[ignore = "rewrites tests/schemas"]
 fn update_schema_snapshots() {
     fs::create_dir_all(dir()).unwrap();
     for (stem, decl) in declarations() {
@@ -184,6 +164,5 @@ fn update_schema_snapshots() {
             sent(&decl).canonical_json(),
         )
         .unwrap();
-        let _ = fs::remove_file(dir().join(format!("{stem}.podium.json")));
     }
 }

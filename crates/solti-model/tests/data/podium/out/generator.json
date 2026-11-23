@@ -1,7 +1,0 @@
-{
-  "podium_ref": "c43a259",
-  "podium_commit": "c43a259279d3daad8a726dec724dfc53cd3468ab",
-  "go_image": "ghcr.io/mr-chelyshkin/ci/golang:1.27.4",
-  "generated_at": "2026-11-23T07:06:13Z",
-  "generator_sha256": "16843c7f22a174adb294d99b08a2b4e01b836f1b36b94f9018af4d3a11a05fa2"
-}

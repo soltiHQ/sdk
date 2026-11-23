@@ -67,14 +67,10 @@ A declared check runs synchronously at admission, under the Task's write lock
 and a state-write admission permit. A check that does I/O or waits stalls every
 write to that Task. Decode and compare only.
 
-## Trusting that a schema Podium cannot compile will be reported
+## Renaming a body type
 
-Podium refuses a schema outside its subset without telling the agent; the agent
-sees nothing and the type shows as `refused` in Podium's catalog. The SDK
-refuses the same schemas at registration, so a registration error is the
-warning. Renaming a body type changes its schema fingerprint, and `(?` followed
-by `i`, `m`, `s`, `U` or `-` anywhere in a pattern is refused, even in
-`^\(?-?\d+\)?$`. See [declare workload types](routing-and-custom-runners.md#declare-workload-types).
+Renaming a body type changes its schema fingerprint, and Podium groups agents
+by that fingerprint. See [declare workload types](routing-and-custom-runners.md#declare-workload-types).
 
 See [routing and custom runners](routing-and-custom-runners.md) and
 [containers and isolation](containers-and-isolation.md).

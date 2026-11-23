@@ -1,8 +1,0 @@
-{
-  "patternProperties": {
-    "^[a-z]+$": {
-      "type": "string"
-    },
-    "^x-": true
-  }
-}

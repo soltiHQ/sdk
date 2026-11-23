@@ -73,7 +73,7 @@ pub enum RouterError {
     },
 
     /// A runner declares a workload type that cannot be used: a refused GVK, a reserved group or
-    /// a schema outside the supported subset.
+    /// a schema that is not a JSON object or is over 64 KiB.
     #[error(
         "runner '{runner}' declares {api_version}/{kind} with an unusable declaration: {reason}"
     )]

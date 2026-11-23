@@ -1,1 +1,0 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"children":{"items":{"$ref":"#"},"type":"array"},"name":{"type":"string"},"next":{"anyOf":[{"$ref":"#"},{"type":"null"}]}},"required":["name","children"],"title":"Tree","type":"object"}

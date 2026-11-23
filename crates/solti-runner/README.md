@@ -133,7 +133,7 @@ Registration validates and snapshots the runner declaration.
 - The reserved `solti.io` group is rejected.
 - At least one workload type is required.
 - Duplicate workload GVKs are rejected.
-- A declaration with a refused GVK or a schema outside the supported subset is rejected, naming the runner and GVK.
+- A declaration with a refused GVK or a schema that is not a JSON object or is over 64 KiB is rejected, naming the runner and GVK.
 - At most 64 runners and 256 distinct schema fingerprints per agent.
 - Runner names are unique.
 

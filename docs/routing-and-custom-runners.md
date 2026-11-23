@@ -184,7 +184,7 @@ fn declarations() -> Vec<WorkloadDecl> {
 ```
 
 A declaration never fails its constructor.
-A refused GVK, a reserved group, or a schema outside the supported subset is kept and surfaces as `RouterError::InvalidWorkloadType` when the runner is registered.
+A refused GVK, a reserved group, or a schema that is not a JSON object or is over 64 KiB is kept and surfaces as `RouterError::InvalidWorkloadType` when the runner is registered.
 The router reads `workload_types()` once, at registration, and snapshots it.
 
 The check must be fast and non-blocking.
@@ -236,48 +236,8 @@ Treat any change to the schema, wanted or not, as a new fingerprint.
 
 ### Schema rules
 
-`WorkloadSchema::from_value`, which every declaration runs, refuses at registration everything Podium's compiler refuses.
-Podium refuses a schema it dislikes without telling the agent, so the SDK check is the only warning you get; see [what the agent can see](discovery.md#exchange-workload-schemas).
-
-**The subset.** Draft 2020-12 with its core, applicator, validation, annotation and content keywords (52 in all, listed in the [subset source](../crates/solti-model/src/domain/workload/schema/subset.rs)), with these exceptions:
-
-- refused: `$dynamicRef`, `$dynamicAnchor`, `$recursiveRef`, `$recursiveAnchor`, `$vocabulary`, `unevaluatedProperties`, `unevaluatedItems`;
-- `$ref` resolves only inside the document: `#`, `#/json/pointer` or `#anchor`; a remote or unresolved reference, a duplicated `$anchor`, an `$id` below the root and a cycle of subschemas at the same location of a body are refused;
-- unknown keywords and `x-*` keywords are ignored.
-
-**The limits.**
-
-| Limit | Value |
-|---|---|
-| Canonical JSON | 65 536 bytes |
-| Nesting of objects and arrays | 32 levels, the root object is level 1 |
-| Objects and booleans, wherever they are | 512 |
-| One regex | 1 024 bytes of source; 2 000 instructions, a class counted by its ranges |
-| All regexes of one schema | 16 KiB of source; 20 000 instructions |
-| `\p` or `\P` written in one regex | 15 |
-| `\p` or `\P` written in one schema | 153 |
-
-The last two are Podium's regex budget: it charges each `\p` or `\P` in the raw text 833 units of parse work, against 128 000 for a schema, and 153 × 833 fits where 154 does not.
-Every `\p` counts, even the `\p` of an escaped backslash, as in `\\p`.
-A rejected schema names its location, such as `#/properties/name`, and the rule it breaks.
-
-**Regexes.** Podium compiles each `pattern` and `patternProperties` key with Go's RE2 parser; the SDK reads it with Rust's `regex-syntax` and refuses a pattern unless both read it alike.
-Some rules are therefore stricter in the SDK than in Podium, and a pattern Podium would accept can still be refused here:
-
-- `\p{...}` and `\pL` classes: Podium sizes them from Go's Unicode tables, which the SDK cannot reproduce. Write explicit ranges.
-- Syntax that Rust and Go read differently: `\<`, `\>` and `\b{start}`-style boundaries; `&&`, `--` and `~~` inside brackets; a nested `[` or a leading `--` in a class; a counted repetition with a space or a leading zero, as in `a{ 2}` or `a{01}`.
-- Go-only syntax that `regex-syntax` cannot parse: `\Q...\E`, octal escapes such as `\0`, a `{` that starts no repetition such as `x{,5}`, `(?)`, and class escapes before `-` as in `[\d-z]`.
-  Go may accept them, but the SDK cannot parse them to check them, so it refuses them (`SdkStrictRegexRule::GoOnlySyntax`).
-
-Both sides refuse look-around, back-references, `\u`, `\Z` and counts over 1 000.
-Near the instruction limits the SDK may also refuse a pattern Podium accepts: it counts a class of two non-ASCII fold-equivalent characters, such as `[Δδ]`, as a class, where Go rewrites it as a case-folded literal, so the SDK's count is higher. Write the literal form instead.
-Case-insensitive matching is not available: Podium refuses `(?` followed by `i`, `m`, `s`, `U` or `-` anywhere in a pattern's text, whether or not it is a flag group.
-That also refuses a pattern that only wants an optional parenthesis, such as `^\(?-?\d+\)?$`, because it contains `(?-`.
-Write the optional parentheses as classes instead:
-
-```json
-{ "type": "string", "pattern": "^[(]?-?\\d+[)]?$" }
-```
+`WorkloadSchema::from_value`, which every declaration runs, refuses a schema that is not a JSON object or whose canonical JSON is over 65 536 bytes.
+Podium compiles the schema and validates spec bodies against it; a schema Podium cannot compile shows as `refused` in its workload catalog.
 
 **Integers.** JSON peers read integers exactly only up to 2^53.
 Integers in a body, nested ones included, must lie within plus or minus 9 007 199 254 740 991 (`MAX_JSON_SAFE_INTEGER`).

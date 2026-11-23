@@ -1,27 +1,12 @@
 //! # Workload schemas
 //!
 //! A runner publishes one JSON Schema for each workload type it runs. Podium
-//! names a schema by its fingerprint and compiles it with its own draft 2020-12
-//! subset (`internal/workloadschema` at commit a1b7ee4). Podium refuses a
-//! schema outside that subset without telling the agent, so
-//! [`WorkloadSchema::from_value`] refuses, when the runner registers,
-//! everything Podium's compiler refuses. It runs, in order:
-//!
-//! 1. the object check: a schema is a JSON object;
-//! 2. canonicalization: the RFC 8785 bytes of [`canonical_json`], which the
-//!    fingerprint hashes and the SDK sends;
-//! 3. the size of those bytes: at most [`MAX_WORKLOAD_SCHEMA_BYTES`];
-//! 4. the shape: objects and arrays nest at most [`MAX_WORKLOAD_SCHEMA_DEPTH`]
-//!    levels, and the schema holds at most [`MAX_WORKLOAD_SCHEMA_VALUES`]
-//!    objects and booleans;
-//! 5. the subset walk: the positions and keyword checks of Podium's compiler,
-//!    `$ref` resolution inside the document, `$anchor` and same-location cycles;
-//! 6. the regexes: each `pattern` and `patternProperties` key, in the order the
-//!    walk met them, against the RE2 syntax that Go and Rust read alike and
-//!    against Podium's bounds on regexes, for one regex and for the schema.
+//! names a schema by its fingerprint and validates spec bodies against it.
+//! [`WorkloadSchema::from_value`] checks that a schema is a JSON object, writes
+//! its RFC 8785 canonical JSON ([`canonical_json`]), which the SDK sends, and
+//! refuses canonical JSON over [`MAX_WORKLOAD_SCHEMA_BYTES`].
 //!
 //! The fingerprint is the lowercase hex SHA-256 of the canonical bytes.
-
 use std::{
     fmt,
     hash::{Hash, Hasher},
@@ -35,46 +20,8 @@ use thiserror::Error;
 
 use crate::ModelError;
 
-mod regex;
-mod shape;
-mod subset;
-
 /// Most bytes the canonical JSON of a workload schema may take.
 pub const MAX_WORKLOAD_SCHEMA_BYTES: usize = 64 * 1024;
-
-/// Most levels the objects and arrays of a workload schema may nest; the root
-/// object is level 1.
-pub const MAX_WORKLOAD_SCHEMA_DEPTH: usize = 32;
-
-/// Most objects and booleans a workload schema may hold, wherever they are.
-pub const MAX_WORKLOAD_SCHEMA_VALUES: usize = 512;
-
-/// Most bytes of source one regex of a workload schema may take.
-pub const MAX_SCHEMA_REGEX_SOURCE_BYTES: usize = 1024;
-
-/// Most bytes of source the regexes of one workload schema may take together.
-pub const MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL: usize = 16 * 1024;
-
-/// Most times one regex may write `\p` or `\P`: Podium's `maxUnicodeClasses`.
-///
-/// Podium counts each occurrence in the raw text as a Unicode class, even one
-/// that is not, such as the `\p` of `\\p`.
-pub const MAX_SCHEMA_REGEX_UNICODE_ESCAPES: usize = 15;
-
-/// Most times the regexes of one workload schema may write `\p` or `\P`
-/// together.
-///
-/// Podium charges each 833 ranges of parse work, within 128 000 for a schema:
-/// 153 fit, 154 do not.
-pub const MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL: usize = 153;
-
-/// Most instructions and class ranges the program of one regex may take, as
-/// Podium measures it.
-pub const MAX_SCHEMA_REGEX_INSTRUCTIONS: usize = 2_000;
-
-/// Most instructions and class ranges the programs of one workload schema's
-/// regexes may take together.
-pub const MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL: usize = 20_000;
 
 /// The one `$schema` a workload schema may declare. A schema may also omit it.
 pub const WORKLOAD_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -159,8 +106,7 @@ impl Serialize for SchemaFingerprint {
     }
 }
 
-/// A workload schema inside Podium's subset: its canonical JSON and its
-/// fingerprint.
+/// A workload schema: its canonical JSON and its fingerprint.
 ///
 /// Two schemas are equal, and hash alike, when their fingerprints are.
 /// `Debug` shows the fingerprint and the size, never the schema itself.
@@ -173,7 +119,8 @@ pub struct WorkloadSchema {
 impl WorkloadSchema {
     /// Checks a schema and canonicalizes it.
     ///
-    /// The module documentation lists the checks, in the order they run.
+    /// It must be a JSON object whose canonical JSON takes at most
+    /// [`MAX_WORKLOAD_SCHEMA_BYTES`].
     ///
     /// # Errors
     ///
@@ -186,14 +133,13 @@ impl WorkloadSchema {
             ));
         }
         let canonical = canonical_json(value)?;
-        shape::check_size(&canonical)?;
-        shape::check_shape(&canonical)?;
-        let patterns = subset::check(value)?;
-        let mut budget = regex::RegexBudget::default();
-        for pattern in patterns {
-            budget
-                .charge(pattern.text)
-                .map_err(|reason| WorkloadSchemaError::new(pattern.at.to_string(), reason))?;
+        if canonical.len() > MAX_WORKLOAD_SCHEMA_BYTES {
+            return Err(WorkloadSchemaError::root(
+                WorkloadSchemaErrorReason::TooLarge {
+                    bytes: canonical.len(),
+                    limit: MAX_WORKLOAD_SCHEMA_BYTES,
+                },
+            ));
         }
         let fingerprint = SchemaFingerprint::of(&canonical);
         Ok(Self {
@@ -293,177 +239,6 @@ pub enum WorkloadSchemaErrorReason {
         limit: usize,
     },
 
-    /// Objects and arrays nest deeper than [`MAX_WORKLOAD_SCHEMA_DEPTH`].
-    #[error("its objects and arrays nest deeper than {limit} levels")]
-    TooDeep {
-        /// The limit.
-        limit: usize,
-    },
-
-    /// The schema holds more than [`MAX_WORKLOAD_SCHEMA_VALUES`] objects and
-    /// booleans.
-    #[error("it holds {count} objects and booleans, over the limit of {limit}")]
-    TooManyValues {
-        /// Objects and booleans in the schema.
-        count: usize,
-        /// The limit.
-        limit: usize,
-    },
-
-    /// A draft 2020-12 keyword that the subset leaves out.
-    #[error("keyword `{keyword}` is not supported: {why}")]
-    UnsupportedKeyword {
-        /// The keyword.
-        keyword: &'static str,
-        /// Why the subset leaves it out.
-        why: &'static str,
-    },
-
-    /// A keyword of the subset whose value is not what the keyword takes.
-    #[error("keyword `{keyword}` must be {expected}")]
-    InvalidKeywordValue {
-        /// The keyword.
-        keyword: &'static str,
-        /// What it takes.
-        expected: &'static str,
-    },
-
-    /// `$schema` names another dialect than [`WORKLOAD_SCHEMA_DIALECT`].
-    #[error(
-        "`$schema` is {value}: a workload schema is draft 2020-12 \
-         (`https://json-schema.org/draft/2020-12/schema`) or has no `$schema`"
-    )]
-    UnsupportedDialect {
-        /// The `$schema` value, as JSON text unless it is a string.
-        value: String,
-    },
-
-    /// `$id` below the root.
-    #[error("`$id` is allowed only at the root of a workload schema")]
-    NestedId,
-
-    /// `$ref` to anything outside the document.
-    #[error(
-        "`$ref` {reference:?} is a remote reference: a workload schema refers \
-         only inside itself, by \"#\", \"#/json/pointer\" or \"#anchor\""
-    )]
-    RemoteReference {
-        /// The reference.
-        reference: String,
-    },
-
-    /// `$ref` that resolves to no subschema of the document.
-    #[error("`$ref` {reference:?} does not resolve to a subschema of this document")]
-    UnresolvedReference {
-        /// The reference.
-        reference: String,
-    },
-
-    /// An `$anchor` that another subschema declares too.
-    #[error("`$anchor` {anchor:?} is declared by another subschema too")]
-    DuplicateAnchor {
-        /// The anchor.
-        anchor: String,
-    },
-
-    /// Subschemas that refer back to themselves at the same location of a
-    /// body, which no body could be evaluated against.
-    #[error(
-        "the subschema refers back to itself at the same location of a body (a reference cycle)"
-    )]
-    ReferenceCycle,
-
-    /// A regex that Podium refuses: Go cannot parse it, or Podium refuses its
-    /// syntax. A regex that Rust's `regex-syntax` cannot parse lands here only
-    /// when Go's parser refuses it too; otherwise it is
-    /// [`SdkStrictRegexRule::GoOnlySyntax`].
-    #[error("regex {pattern:?} is refused: {why}")]
-    InvalidRegex {
-        /// The regex.
-        pattern: String,
-        /// Why.
-        why: String,
-    },
-
-    /// A regex the SDK refuses although Podium's Go parser may accept it.
-    #[error("regex {pattern:?} is refused by the SDK, although Go may accept it: {rule}")]
-    SdkStrictRegex {
-        /// The regex.
-        pattern: String,
-        /// The SDK-strict rule it breaks.
-        rule: SdkStrictRegexRule,
-    },
-
-    /// A regex over [`MAX_SCHEMA_REGEX_SOURCE_BYTES`].
-    #[error("a regex of {bytes} bytes is over the limit of {limit}")]
-    RegexTooLong {
-        /// Bytes of source.
-        bytes: usize,
-        /// The limit.
-        limit: usize,
-    },
-
-    /// A regex that writes `\p` or `\P` more than
-    /// [`MAX_SCHEMA_REGEX_UNICODE_ESCAPES`] times.
-    #[error("regex {pattern:?} writes `\\p` or `\\P` {count} times, over the limit of {limit}")]
-    RegexTooManyUnicodeEscapes {
-        /// The regex.
-        pattern: String,
-        /// Occurrences of `\p` and `\P` in its source.
-        count: usize,
-        /// The limit.
-        limit: usize,
-    },
-
-    /// A regex whose program is over [`MAX_SCHEMA_REGEX_INSTRUCTIONS`].
-    #[error(
-        "regex {pattern:?} compiles to {} instructions and ranges, over the limit of {limit}",
-        instructions_text(.instructions)
-    )]
-    RegexTooLarge {
-        /// The regex.
-        pattern: String,
-        /// Its instructions and class ranges, stopped past the schema's limit.
-        instructions: usize,
-        /// The limit.
-        limit: usize,
-    },
-
-    /// The regexes of the schema take more than
-    /// [`MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL`] bytes of source.
-    #[error("the schema's regexes take {bytes} bytes of source, over the limit of {limit} in all")]
-    SchemaRegexesTooLong {
-        /// Bytes of source so far.
-        bytes: usize,
-        /// The limit.
-        limit: usize,
-    },
-
-    /// The regexes of the schema write `\p` or `\P` more than
-    /// [`MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL`] times.
-    #[error(
-        "the schema's regexes write `\\p` or `\\P` {count} times, over the limit of {limit} in all"
-    )]
-    SchemaRegexesTooManyUnicodeEscapes {
-        /// Occurrences so far.
-        count: usize,
-        /// The limit.
-        limit: usize,
-    },
-
-    /// The programs of the schema's regexes take more than
-    /// [`MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL`].
-    #[error(
-        "the schema's regexes compile to {instructions} instructions and ranges, \
-         over the limit of {limit} in all"
-    )]
-    SchemaRegexesTooLarge {
-        /// Instructions and class ranges so far.
-        instructions: usize,
-        /// The limit.
-        limit: usize,
-    },
-
     /// Text that is not a [`SchemaFingerprint`].
     #[error("{value:?} is not a schema fingerprint: want 64 lowercase hex characters")]
     InvalidFingerprint {
@@ -474,94 +249,6 @@ pub enum WorkloadSchemaErrorReason {
     /// A value with no RFC 8785 canonical form.
     #[error("it cannot be written as RFC 8785 canonical JSON: {0}")]
     NotCanonicalizable(String),
-}
-
-/// Why the SDK refuses a regex that Podium's Go parser may accept.
-///
-/// These rules are the SDK's own, stricter than Podium on purpose: a pattern
-/// that breaks one is refused with
-/// [`WorkloadSchemaErrorReason::SdkStrictRegex`], and [`Self::ALL`] lists them.
-///
-/// Case-insensitive matching never reaches them: every inline flag group,
-/// `(?i)` among them, is refused first, as Podium refuses it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum SdkStrictRegexRule {
-    /// `\pL`, `\p{Greek}`, `\P{Han}`: a Unicode property class, whose size in
-    /// Podium depends on Go's Unicode tables.
-    UnicodeClass,
-    /// `\<`, `\>`, `\b{start}`, `\b{end}`, `\b{start-half}` or `\b{end-half}`:
-    /// a word boundary in Rust, literal text in Go.
-    WordBoundaryExtension,
-    /// `&&`, `--` or `~~` inside brackets: a set operation in Rust, literal
-    /// characters in Go.
-    ClassSetOperation,
-    /// A bracketed class that Go reads with other characters or another end,
-    /// such as the nested `[b]` of `[a[b]]`, or the leading `--a` of `[--a]`,
-    /// a range in Go.
-    ClassReadDifferently,
-    /// A counted repetition that Go reads as literal text: a space inside the
-    /// braces, as in `a{ 2}`, or a count with a leading zero, as in `a{01}`.
-    RepetitionReadAsLiteral,
-    /// Syntax that Go's parser reads and Rust's `regex-syntax` cannot parse:
-    /// `\Q…\E`, an octal escape such as `\0`, a `{` that starts no repetition
-    /// (`{`, `x{,5}`), `(?)`, `\x{D800}`, a capture name that starts with a
-    /// digit or names two groups, or, inside brackets, an unescaped `[` or a
-    /// class escape before `-`, as in `[\d-z]`.
-    GoOnlySyntax,
-}
-
-impl SdkStrictRegexRule {
-    /// Every SDK-strict rule.
-    pub const ALL: &'static [Self] = &[
-        Self::UnicodeClass,
-        Self::WordBoundaryExtension,
-        Self::ClassSetOperation,
-        Self::ClassReadDifferently,
-        Self::RepetitionReadAsLiteral,
-        Self::GoOnlySyntax,
-    ];
-}
-
-impl fmt::Display for SdkStrictRegexRule {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::UnicodeClass => {
-                "a Unicode property class (\\p…, \\P…) is sized by Go's Unicode tables, \
-                 which the SDK cannot reproduce; write explicit ranges instead"
-            }
-            Self::WordBoundaryExtension => {
-                "\\<, \\> and \\b{…} are word boundaries in Rust but literal text in Go"
-            }
-            Self::ClassSetOperation => {
-                "&&, -- and ~~ inside brackets are set operations in Rust but literal \
-                 characters in Go"
-            }
-            Self::ClassReadDifferently => {
-                "Go reads this bracketed class differently (a nested [ is literal in Go, \
-                 and a leading -- starts a range); escape the character"
-            }
-            Self::RepetitionReadAsLiteral => {
-                "Go reads this counted repetition as literal text; write {n}, {n,} or \
-                 {n,m} with no spaces and no leading zeros"
-            }
-            Self::GoOnlySyntax => {
-                "the SDK cannot parse this syntax, although Go may accept it; write it as \
-                 both read it: escapes instead of octal and \\Q…\\E, a backslash before a \
-                 literal {, [ or -, and capture names that start with a letter and differ"
-            }
-        })
-    }
-}
-
-/// A count of instructions for a message: Podium stops counting past the
-/// schema's limit.
-fn instructions_text(instructions: &usize) -> String {
-    if *instructions > MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL {
-        format!("more than {MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL}")
-    } else {
-        instructions.to_string()
-    }
 }
 
 /// Text quoted in an error, cut to its first 80 bytes at a character boundary.

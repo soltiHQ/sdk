@@ -28,11 +28,7 @@ mod workload;
 pub use workload::{BoundJsonSafeIntegers, workload_schema_for};
 pub use workload::{
     EMBEDDED_WORKLOAD_API_VERSION, EMBEDDED_WORKLOAD_KIND, EmbeddedSpec, MAX_JSON_SAFE_INTEGER,
-    MAX_SCHEMA_REGEX_INSTRUCTIONS, MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL,
-    MAX_SCHEMA_REGEX_SOURCE_BYTES, MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL,
-    MAX_SCHEMA_REGEX_UNICODE_ESCAPES, MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL,
-    MAX_WORKLOAD_BODY_DEPTH, MAX_WORKLOAD_SCHEMA_BYTES, MAX_WORKLOAD_SCHEMA_DEPTH,
-    MAX_WORKLOAD_SCHEMA_VALUES, SchemaFingerprint, SdkStrictRegexRule, TaskWorkload,
+    MAX_WORKLOAD_BODY_DEPTH, MAX_WORKLOAD_SCHEMA_BYTES, SchemaFingerprint, TaskWorkload,
     WORKLOAD_SCHEMA_DIALECT, Workload, WorkloadBody, WorkloadBodyError, WorkloadBodyErrorKind,
     WorkloadDecl, WorkloadDeclError, WorkloadSchema, WorkloadSchemaError,
     WorkloadSchemaErrorReason, WorkloadType, WorkloadTypeMeta, canonical_json,

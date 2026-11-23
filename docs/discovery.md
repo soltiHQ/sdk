@@ -200,9 +200,8 @@ If a later response requests it again, Podium lost it, as after a restart with t
 A refused schema is therefore sent once more each time a restarted Podium requests it, and refused again.
 
 Podium's refusal of a schema is silent to the agent.
-Podium stops requesting a schema outside its subset or over its limits, and the agent cannot tell that from success.
+Podium stops requesting a schema it cannot compile, and the agent cannot tell that from success.
 Look in Podium's workload catalog, where the fingerprint shows as `refused` with the reason, and in the placement detail of a spec bound to it, which reports `schema_incompatible`.
-The SDK checks every schema against Podium's rules when the runner is registered, which is the only early warning; see [declare workload types](routing-and-custom-runners.md#declare-workload-types).
 
 Podium re-checks a target's compatibility before every push, so a schema that stops accepting a deployed body fails the rollout instead of pushing it.
 

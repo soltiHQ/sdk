@@ -1,7 +1,0 @@
-{
-  "dependentSchemas": {
-    "x": {
-      "$ref": "#"
-    }
-  }
-}

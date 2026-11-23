@@ -287,8 +287,7 @@ flowchart LR
     Type --> Capability
 ```
 
-- `workload/schema/` owns the Podium-compatible subset walk (`subset.rs`), the size and shape limits (`shape.rs`), the regex rules (`regex.rs`), RFC 8785 canonical JSON and the fingerprint (`mod.rs`).
-  Podium refuses a schema without telling the agent, so these checks mirror its compiler position for position; the snapshots under `tests/schemas` and the vectors in `tests/podium_vectors.rs` pin them against Podium's output.
+- `workload/schema/` owns RFC 8785 canonical JSON, the size limit and the fingerprint (`mod.rs`).
 - `workload/generate.rs` derives a schema from a Rust type: draft 2020-12, `unevaluatedProperties` rewritten, 64-bit integers bounded to 2^53 - 1.
 - `workload/decl.rs` keeps an unusable declaration as an error until registration.
   Its check runs under core's per-task lock and a state-write admission permit, so it must be fast and non-blocking.
@@ -326,7 +325,7 @@ flowchart LR
 | `TaskStatus`                                  | Conditions, generations, lifecycle fields       |
 | `TaskRun`                                     | Generation, attempt, phase, finish fields       |
 | `RunnerCapability` and `AgentCapabilities`    | Names, labels, GVKs, fingerprints, uniqueness and caps |
-| `WorkloadDecl`                                | GVK, reserved group, schema subset and limits   |
+| `WorkloadDecl`                                | GVK, reserved group, schema size                |
 | `TaskFilter` and `TaskContinuation`           | Selector and cursor fields                      |
 | `WorkloadTypeMeta` and routed workloads       | CRD-compatible GVK                              |
 
@@ -445,7 +444,6 @@ Runtime behavior belongs in the crate that owns that runtime.
 | Conditional write contract                  | [`src/resource/preconditions.rs`](src/resource/preconditions.rs)                                                                                 | precondition tests                               |
 | Spec fields or defaults                     | [`src/resource/spec.rs`](src/resource/spec.rs)                                                                                                   | spec tests and README defaults                   |
 | Workload envelope or declaration            | [`src/domain/workload/`](src/domain/workload)                                                                                                    | workload tests and `tests/serde_roundtrip.rs`    |
-| Schema subset, limits or regex rules        | [`src/domain/workload/schema/`](src/domain/workload/schema)                                                                                      | `tests/podium_vectors.rs`, `tests/schema_samples.rs` |
 | Phase or status transition                  | [`src/resource/status.rs`](src/resource/status.rs), [`src/resource/task.rs`](src/resource/task.rs), [`src/domain/phase.rs`](src/domain/phase.rs) | status and task tests                            |
 | Condition semantics                         | [`src/resource/condition.rs`](src/resource/condition.rs)                                                                                         | condition and status tests                       |
 | Attempt record                              | [`src/resource/run.rs`](src/resource/run.rs)                                                                                                     | run tests and `tests/serde_roundtrip.rs`         |

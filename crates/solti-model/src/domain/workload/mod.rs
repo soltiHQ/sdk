@@ -1,8 +1,7 @@
 //! # Workload types
 //!
 //! [`WorkloadSchema`] is the JSON Schema a runner publishes for one workload
-//! type: RFC 8785 canonical bytes, their [`SchemaFingerprint`], and the check
-//! that keeps the schema inside the draft 2020-12 subset Podium compiles.
+//! type: RFC 8785 canonical bytes and their [`SchemaFingerprint`].
 //!
 //! [`TaskWorkload`] is the desired state a task runs: a [`Workload`] routed by
 //! its GVK, or the SDK-internal [`EmbeddedSpec`]. [`WorkloadBody`] decodes a
@@ -31,10 +30,6 @@ pub use generate::{BoundJsonSafeIntegers, workload_schema_for};
 
 mod schema;
 pub use schema::{
-    MAX_SCHEMA_REGEX_INSTRUCTIONS, MAX_SCHEMA_REGEX_INSTRUCTIONS_TOTAL,
-    MAX_SCHEMA_REGEX_SOURCE_BYTES, MAX_SCHEMA_REGEX_SOURCE_BYTES_TOTAL,
-    MAX_SCHEMA_REGEX_UNICODE_ESCAPES, MAX_SCHEMA_REGEX_UNICODE_ESCAPES_TOTAL,
-    MAX_WORKLOAD_SCHEMA_BYTES, MAX_WORKLOAD_SCHEMA_DEPTH, MAX_WORKLOAD_SCHEMA_VALUES,
-    SchemaFingerprint, SdkStrictRegexRule, WORKLOAD_SCHEMA_DIALECT, WorkloadSchema,
+    MAX_WORKLOAD_SCHEMA_BYTES, SchemaFingerprint, WORKLOAD_SCHEMA_DIALECT, WorkloadSchema,
     WorkloadSchemaError, WorkloadSchemaErrorReason, canonical_json,
 };

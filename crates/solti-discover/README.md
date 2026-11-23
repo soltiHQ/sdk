@@ -189,7 +189,7 @@ gRPC.
 A failed follow-up is logged at WARN and does not fail the attempt, whatever
 the error: the next attempt's follow-ups send what is still requested.
 
-The control plane refuses a schema outside its subset silently: it stops
+The control plane refuses a schema it cannot compile silently: it stops
 requesting it. The agent cannot see that. Look at the control plane's workload
 catalog, where the schema is `refused`, and at placement, which reports
 `schema_incompatible` with the reason.

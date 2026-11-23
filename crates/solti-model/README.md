@@ -370,18 +370,8 @@ A schema is identified by its fingerprint: the lowercase hex SHA-256 of its RFC 
 The root `title` (the Rust type's name), the names of nested types (the keys of `$defs`) and doc comments (`description`) are all in those bytes: renaming a body type changes its fingerprint.
 Pin a name with `#[schemars(rename = "...")]`.
 
-`WorkloadSchema::from_value` refuses at registration everything Podium refuses without telling the agent:
-
-- the subset: draft 2020-12 minus `$dynamicRef`, `$dynamicAnchor`, `$recursiveRef`, `$recursiveAnchor`, `$vocabulary`, `unevaluatedProperties` and `unevaluatedItems`; `$ref` only inside the document; no `$ref` cycle at one location of a body;
-- the limits: 64 KiB of canonical JSON, 32 levels of nesting, 512 objects and booleans, a regex of at most 1 024 bytes and 2 000 instructions, 20 000 instructions and 16 KiB of regex source per schema, at most 15 raw `\p` or `\P` per regex and 153 per schema (each is charged 833 units of Podium's 128 000);
-- Podium's refusal of `(?` followed by `i`, `m`, `s`, `U` or `-` anywhere in a pattern, which also refuses `^\(?-?\d+\)?$`; write `^[(]?-?\d+[)]?$`.
-
-The SDK is stricter than Podium for regexes it cannot prove both parsers read alike (`SdkStrictRegexRule`):
-`\p{...}` classes, which Podium sizes from Go's Unicode tables;
-syntax whose meaning differs between Rust's `regex-syntax` and Go's RE2 (`\<`, `\b{start}`, set operations in brackets, a nested `[`, `a{ 2}`);
-and Go-only syntax that `regex-syntax` cannot parse (`\Q...\E`, `x{,5}`, octal escapes).
-Case-insensitive matching never arises, because inline flags are refused.
-Near the instruction limits the SDK may also refuse a pattern Podium accepts: it counts a class of two non-ASCII fold-equivalent characters, such as `[Δδ]`, as a class, where Go rewrites it as a case-folded literal, so the SDK's count is higher. Write the literal form instead.
+`WorkloadSchema::from_value` refuses a schema that is not a JSON object or whose canonical JSON is over 64 KiB.
+Podium compiles the schema and validates spec bodies against it.
 
 Body types should avoid `#[serde(flatten)]` combined with `deny_unknown_fields`, which serde does not support.
 The [routing guide](https://github.com/soltiHQ/sdk/blob/main/docs/routing-and-custom-runners.md) has the full rules.

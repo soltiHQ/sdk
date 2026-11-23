@@ -1,1 +1,0 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"id":{"type":"string"},"own":{"format":"uint32","minimum":0,"type":"integer"},"tags":{"items":{"type":"string"},"type":"array"}},"required":["own","id","tags"],"title":"Flattened","type":"object"}
