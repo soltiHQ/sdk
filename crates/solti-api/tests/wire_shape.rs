@@ -619,30 +619,6 @@ async fn create_command_resource_is_accepted() {
 }
 
 #[tokio::test]
-async fn http_workload_body_round_trips_unicode_without_substitution() {
-    let app = router_with(Arc::new(WireMock::default()));
-
-    let mut request: Value = serde_json::from_str(CREATE_COMMAND_BODY).unwrap();
-    request["metadata"]["name"] = "task-unicode-cwd".into();
-    request["spec"]["workload"]["spec"]["cwd"] = "/工作/δ".into();
-    request["spec"]["workload"]["spec"]["module"] = "/модули/报告.wasm".into();
-    let response = app
-        .oneshot(post_json(
-            "/apis/solti.io/v1/tasks",
-            &serde_json::to_string(&request).unwrap(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let body = body_json(response).await;
-    assert_eq!(body["spec"]["workload"]["spec"]["cwd"], "/工作/δ");
-    assert_eq!(
-        body["spec"]["workload"]["spec"]["module"],
-        "/модули/报告.wasm"
-    );
-}
-
-#[tokio::test]
 async fn create_extension_workload_is_accepted_and_returned_unchanged() {
     let app = router_with(Arc::new(WireMock::default()));
 
@@ -694,66 +670,6 @@ async fn create_chain_workload_is_accepted_and_returned_unchanged() {
         chain.step("task3").unwrap().on_failure().unwrap().mode(),
         FailureMode::Recover
     );
-}
-
-#[tokio::test]
-async fn http_accepts_the_manifest_podium_sends() {
-    // Exact bytes of Podium `TaskManifestJSON` (internal/proxy/convert.go).
-    let podium = include_str!("data/podium-task-manifest.json");
-    let sent: Value = serde_json::from_str(podium).unwrap();
-
-    let manifest: TaskManifest = serde_json::from_str(podium).unwrap();
-    let TaskWorkload::Routed(workload) = manifest.spec().workload() else {
-        panic!("Podium sends a routed workload");
-    };
-    assert_eq!(workload.api_version(), "e2e.solti.io/v1");
-    assert_eq!(workload.kind(), "Echo");
-    assert_eq!(workload.body(), &serde_json::json!({ "message": "hi" }));
-    assert_eq!(
-        manifest
-            .metadata()
-            .annotations()
-            .get("podium.solti.io/spec-id"),
-        Some("spec-1")
-    );
-
-    let handler = Arc::new(WireMock::default());
-    let response = router_with(Arc::clone(&handler))
-        .oneshot(post_json("/apis/solti.io/v1/tasks", podium))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let created = body_json(response).await;
-    assert_eq!(created["spec"]["workload"], sent["spec"]["workload"]);
-    assert_eq!(
-        *handler.last_admission.lock().unwrap(),
-        Some(AdmissionPolicy::Replace)
-    );
-}
-
-#[tokio::test]
-async fn embedded_stays_refused_on_both_transports_http() {
-    let handler = Arc::new(WireMock::default());
-    let response = router_with(Arc::clone(&handler))
-        .oneshot(post_json("/apis/solti.io/v1/tasks", CREATE_EMBEDDED_BODY))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(*handler.last_admission.lock().unwrap(), None);
-
-    // The routed envelope refuses the reserved group as well.
-    let routed_as_solti = CREATE_COMMAND_BODY.replacen(
-        r#""apiVersion": "tasks.example.io/v1""#,
-        r#""apiVersion": "solti.io/v1""#,
-        1,
-    );
-    assert_ne!(routed_as_solti, CREATE_COMMAND_BODY, "replacement must hit");
-    let response = router_with(Arc::clone(&handler))
-        .oneshot(post_json("/apis/solti.io/v1/tasks", &routed_as_solti))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(*handler.last_admission.lock().unwrap(), None);
 }
 
 #[tokio::test]

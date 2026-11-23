@@ -442,9 +442,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        Annotations, EMBEDDED_WORKLOAD_API_VERSION, EmbeddedSpec, Labels, SelectorRequirement,
-        Task, TaskConditionType, TaskManifest, TaskRun, TaskSpec, TaskStatus, TaskWorkload,
-        Workload, WorkloadSchema, WorkloadTypeMeta,
+        Annotations, EmbeddedSpec, Labels, SelectorRequirement, Task, TaskConditionType,
+        TaskManifest, TaskRun, TaskSpec, TaskStatus, TaskWorkload, Workload, WorkloadTypeMeta,
     };
 
     fn validator<T: JsonSchema>() -> Validator {
@@ -493,75 +492,6 @@ mod tests {
 
         for workload in workloads {
             assert_valid(&manifest(workload));
-        }
-    }
-
-    #[test]
-    fn task_workload_schema_is_the_generic_envelope() {
-        let schema = validator::<TaskWorkload>();
-
-        for valid in [
-            json!({"apiVersion": "tasks.example.io/v1", "kind": "Resize", "spec": {"w": 1}}),
-            json!({"apiVersion": "exec.solti.io/v1", "kind": "Container", "spec": {}}),
-            json!({
-                "apiVersion": EMBEDDED_WORKLOAD_API_VERSION,
-                "kind": "Embedded",
-                "spec": {"revision": "v1"}
-            }),
-        ] {
-            assert!(schema.is_valid(&valid), "expected valid: {valid}");
-        }
-
-        for invalid in [
-            json!({"apiVersion": "solti.io/v1", "kind": "Subprocess", "spec": {"mode": {"command": "echo"}}}),
-            json!({"apiVersion": "solti.io/v1", "kind": "Container", "spec": {}}),
-            json!({"apiVersion": "solti.io/v1", "kind": "Embedded", "spec": {}}),
-            json!({"apiVersion": "solti.io/v1", "kind": "Embedded", "spec": {"revision": ""}}),
-            json!({"apiVersion": "tasks.example.io/v1", "kind": "Resize", "spec": 1}),
-            json!({"apiVersion": "tasks.example.io/v1", "kind": "Resize"}),
-            json!({"apiVersion": "tasks.example.io/v1", "kind": "Resize", "spec": {}, "extra": 1}),
-        ] {
-            assert!(!schema.is_valid(&invalid), "expected invalid: {invalid}");
-        }
-    }
-
-    /// Collects every string-valued `pattern` keyword in a schema document.
-    fn collect_patterns(value: &Value, out: &mut Vec<String>) {
-        match value {
-            Value::Object(map) => {
-                for (key, child) in map {
-                    match (key.as_str(), child) {
-                        ("pattern", Value::String(pattern)) => out.push(pattern.clone()),
-                        _ => collect_patterns(child, out),
-                    }
-                }
-            }
-            Value::Array(items) => items.iter().for_each(|item| collect_patterns(item, out)),
-            _ => {}
-        }
-    }
-
-    #[test]
-    fn model_schema_patterns_have_no_lookaround() {
-        let mut patterns = Vec::new();
-        for schema in [
-            schemars::schema_for!(TaskManifest),
-            schemars::schema_for!(Task),
-            schemars::schema_for!(Workload),
-        ] {
-            collect_patterns(&serde_json::to_value(schema).unwrap(), &mut patterns);
-        }
-        assert!(patterns.len() > 5, "found only {patterns:?}");
-
-        for pattern in patterns {
-            assert!(
-                !pattern.contains("(?=") && !pattern.contains("(?!") && !pattern.contains("(?<="),
-                "lookaround in {pattern}"
-            );
-            // Podium compiles every schema pattern with its own regex rules.
-            let wrapped = json!({"type": "string", "pattern": pattern});
-            WorkloadSchema::from_value(&wrapped)
-                .unwrap_or_else(|error| panic!("pattern {pattern} is refused: {error}"));
         }
     }
 

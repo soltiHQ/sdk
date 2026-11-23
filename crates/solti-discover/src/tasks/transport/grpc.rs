@@ -55,7 +55,6 @@ impl GrpcAdapter {
         }
         let secure = scheme == Some("https");
 
-        #[cfg(feature = "tls")]
         {
             if config.tls.is_some() && !secure {
                 return Err(DiscoverError::InvalidConfig(
@@ -73,7 +72,6 @@ impl GrpcAdapter {
             }
         }
 
-        #[cfg(not(feature = "tls"))]
         if secure {
             return Err(DiscoverError::InvalidConfig(
                 "https gRPC discovery requires the tls feature".into(),
@@ -227,14 +225,11 @@ pub(super) mod fake {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
-    use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
     use tonic::codegen::{Body, BoxFuture, Service, StdError, http};
     use tonic::server::{NamedService, UnaryService};
-    use tonic::transport::server::TcpIncoming;
 
     use crate::proto::SyncRequest;
-    use crate::tasks::transport::fake::{FakeControlPlane, FakeServer, Outcome};
+    use crate::tasks::transport::fake::{FakeControlPlane, Outcome};
 
     /// `DiscoverService.Sync` answered by a [`FakeControlPlane`], for any number
     /// of requests.
@@ -343,30 +338,6 @@ pub(super) mod fake {
 
     impl NamedService for TestDiscoverServer {
         const NAME: &'static str = "solti.discover.v1.DiscoverService";
-    }
-
-    /// Serves `control` over gRPC on an ephemeral loopback port.
-    pub(in crate::tasks) async fn serve(control: Arc<FakeControlPlane>) -> FakeServer {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind fake control plane");
-        let address = listener.local_addr().expect("fake control plane address");
-        let service = TestDiscoverServer {
-            expected_authorization: None,
-            calls: Arc::new(AtomicUsize::new(0)),
-            control,
-        };
-        let (shutdown, stopped) = oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(service)
-                .serve_with_incoming_shutdown(TcpIncoming::from(listener), async {
-                    let _ = stopped.await;
-                })
-                .await
-                .expect("fake control plane serves");
-        });
-        FakeServer::new(address, shutdown, task)
     }
 }
 

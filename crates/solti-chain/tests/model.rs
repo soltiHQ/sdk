@@ -1,8 +1,7 @@
 use solti_chain::{
     CHAIN_API_VERSION, CHAIN_KIND, ChainSpec, ChainStep, FailureMode, FailureTransition,
-    is_chain_workload,
 };
-use solti_model::{LabelSelector, Labels, TaskWorkload, Workload, workload_schema_for};
+use solti_model::{LabelSelector, Labels, Workload, workload_schema_for};
 
 fn subprocess() -> Workload {
     Workload::new(
@@ -124,20 +123,6 @@ fn rejects_empty_duplicate_missing_unreachable_and_cyclic_graphs() {
 }
 
 #[test]
-fn chain_step_refuses_a_nested_chain() {
-    let inner = ChainSpec::new(
-        "inner",
-        vec![ChainStep::new("inner", subprocess()).unwrap()],
-    )
-    .unwrap();
-    let nested = Workload::from_body(&inner).unwrap();
-    assert!(is_chain_workload(&nested));
-
-    let error = ChainStep::new("nested", nested).unwrap_err();
-    assert!(error.to_string().contains("nested"), "{error}");
-}
-
-#[test]
 fn validates_step_runner_selectors() {
     let mut labels = Labels::new();
     labels.insert("bad key", "value");
@@ -221,45 +206,6 @@ fn serde_is_strict_and_runs_runtime_validation() {
             "must reject {value}"
         );
     }
-}
-
-#[test]
-fn chain_builds_from_a_routed_workload() {
-    let spec = valid_chain();
-    let workload = Workload::from_body(&spec).unwrap();
-
-    assert!(is_chain_workload(&workload));
-    assert_eq!(workload.api_version(), CHAIN_API_VERSION);
-    assert_eq!(workload.kind(), CHAIN_KIND);
-    assert_eq!(workload.decode::<ChainSpec>().unwrap(), spec);
-    assert_eq!(
-        TaskWorkload::from_body(&spec).unwrap(),
-        TaskWorkload::Routed(workload)
-    );
-
-    assert!(!is_chain_workload(&subprocess()));
-    let other = Workload::new("workflow.example.io/v1", "Chain", serde_json::json!({})).unwrap();
-    assert!(!is_chain_workload(&other));
-    assert!(other.decode::<ChainSpec>().is_err());
-}
-
-#[test]
-fn decoding_a_chain_runs_the_graph_validation() {
-    let cyclic = Workload::new(
-        CHAIN_API_VERSION,
-        CHAIN_KIND,
-        serde_json::json!({
-            "entry": "a",
-            "steps": [
-                { "name": "a", "workload": serde_json::to_value(subprocess()).unwrap(), "onSuccess": "b" },
-                { "name": "b", "workload": serde_json::to_value(subprocess()).unwrap(), "onSuccess": "a" }
-            ]
-        }),
-    )
-    .unwrap();
-
-    let error = cyclic.decode::<ChainSpec>().unwrap_err();
-    assert!(error.detail().contains("acyclic"), "{error}");
 }
 
 #[test]

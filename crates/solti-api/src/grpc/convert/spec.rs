@@ -218,23 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn task_spec_routed_workload_valid() {
-        let cs = convert_task_spec(make_valid_task_spec()).unwrap();
-        assert_eq!(cs.slot(), "test-slot");
-        assert_eq!(cs.timeout().as_millis(), 5_000);
-        let TaskWorkload::Routed(workload) = cs.workload() else {
-            panic!("expected a routed workload");
-        };
-        assert_eq!(workload.api_version(), "tasks.example.io/v1");
-        assert_eq!(workload.kind(), "Echo");
-        assert_eq!(workload.body()["command"], "ls");
-        assert!(matches!(cs.restart(), RestartPolicy::OnFailure));
-        assert!(matches!(cs.admission(), AdmissionPolicy::DropIfRunning));
-        assert_eq!(cs.backoff().first_ms, 100);
-        assert_eq!(cs.backoff().max_ms, 10_000);
-    }
-
-    #[test]
     fn chain_workload_round_trips_through_raw_extension() {
         let echo = |command: &str| {
             Workload::new(

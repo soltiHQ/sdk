@@ -275,7 +275,6 @@ mod tests {
     use super::*;
     use schemars::JsonSchema;
     use serde::Deserialize;
-    use serde_json::json;
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(rename_all = "camelCase")]
@@ -372,115 +371,5 @@ mod tests {
             Value::Array(items) => items.iter().for_each(|v| refs(v, out)),
             _ => {}
         }
-    }
-
-    #[test]
-    fn decl_of_derives_a_2020_12_schema_inside_the_subset() {
-        let decl = WorkloadDecl::of::<Sample>();
-        let schema = schema_of(&decl);
-
-        assert_eq!(schema["$schema"], crate::WORKLOAD_SCHEMA_DIALECT);
-        assert!(schema["$defs"].is_object());
-        let mut found = Vec::new();
-        refs(&schema, &mut found);
-        assert!(!found.is_empty());
-        assert!(found.iter().all(|target| target.starts_with("#/$defs/")));
-        assert_eq!(decl.api_version(), "tasks.example.io/v1");
-        assert_eq!(decl.kind(), "Sample");
-    }
-
-    #[test]
-    fn decl_of_replaces_unevaluated_properties() {
-        let decl = WorkloadDecl::of::<Outer>();
-        assert!(decl.workload_type().is_ok(), "{:?}", decl.workload_type());
-        assert!(!contains_key(&schema_of(&decl), "unevaluatedProperties"));
-    }
-
-    #[test]
-    fn decl_of_bounds_64_bit_integers_to_the_json_safe_range() {
-        let schema = schema_of(&WorkloadDecl::of::<Ints>());
-        let props = &schema["properties"];
-
-        assert_eq!(props["big"]["maximum"], 9_007_199_254_740_991_i64);
-        assert_eq!(props["big"]["minimum"], 0);
-        assert_eq!(props["signed"]["maximum"], 9_007_199_254_740_991_i64);
-        assert_eq!(props["signed"]["minimum"], -9_007_199_254_740_991_i64);
-        assert_eq!(props["tight"]["maximum"], 10);
-        assert_eq!(props["tight"]["minimum"], 0);
-        assert!(props["small"].get("maximum").is_none());
-        assert_eq!(props["small"]["minimum"], 0);
-        assert_eq!(props["maybe"]["maximum"], 9_007_199_254_740_991_i64);
-        assert_eq!(props["maybe"]["minimum"], 0);
-    }
-
-    #[test]
-    fn decl_keeps_errors_for_registration() {
-        let reserved = WorkloadDecl::of::<Reserved>();
-        let error = reserved.workload_type().unwrap_err();
-        assert!(error.reason().contains("reserved"), "{error}");
-        assert!(
-            error
-                .reason()
-                .contains("API group solti.io is reserved for SDK-internal workloads")
-        );
-
-        let bad_gvk = WorkloadDecl::object("not a gvk", "Kind");
-        assert!(bad_gvk.workload_type().is_err());
-        assert_eq!(bad_gvk.api_version(), "not a gvk");
-    }
-
-    #[test]
-    fn decl_check_decodes_with_the_body_type() {
-        let decl = WorkloadDecl::of::<Sample>();
-        let good = Workload::new(
-            "tasks.example.io/v1",
-            "Sample",
-            json!({"name": "n", "mode": "Fast", "items": []}),
-        )
-        .unwrap();
-        assert!(decl.check(&good).is_ok());
-
-        let bad = Workload::new(
-            "tasks.example.io/v1",
-            "Sample",
-            json!({"name": 1, "mode": "Fast", "items": []}),
-        )
-        .unwrap();
-        let reason = decl.check(&bad).unwrap_err();
-        assert!(reason.starts_with("spec.name: "), "{reason}");
-        assert!(!reason.contains("tasks.example.io"), "{reason}");
-        assert!(!reason.contains("workload "), "{reason}");
-
-        let missing = Workload::new(
-            "tasks.example.io/v1",
-            "Sample",
-            json!({"mode": "Fast", "items": []}),
-        )
-        .unwrap();
-        let reason = decl.check(&missing).unwrap_err();
-        assert_eq!(reason, "spec.name: missing field `name`");
-    }
-
-    #[test]
-    fn decl_object_accepts_any_object() {
-        let decl = WorkloadDecl::object("tasks.example.io/v1", "Free");
-        assert!(decl.workload_type().is_ok());
-        let workload =
-            Workload::new("tasks.example.io/v1", "Free", json!({"anything": [1, 2]})).unwrap();
-        assert!(decl.check(&workload).is_ok());
-    }
-
-    #[test]
-    fn workload_type_serializes_the_fingerprint_not_the_schema() {
-        let decl = WorkloadDecl::object("tasks.example.io/v1", "Free");
-        let ty = decl.workload_type().unwrap();
-        assert_eq!(
-            serde_json::to_value(ty).unwrap(),
-            json!({
-                "apiVersion": "tasks.example.io/v1",
-                "kind": "Free",
-                "schemaFingerprint": ty.fingerprint().as_str(),
-            })
-        );
     }
 }

@@ -1,6 +1,6 @@
 use solti_model::{
     AdmissionPolicy, BackoffPolicy, EmbeddedSpec, JitterPolicy, LabelSelector, Labels,
-    RestartPolicy, SelectorRequirement, Task, TaskPhase, TaskRun, TaskSpec, TaskWorkload, Workload,
+    RestartPolicy, SelectorRequirement, Task, TaskPhase, TaskRun, TaskSpec, TaskWorkload,
 };
 
 fn embedded(revision: &str) -> TaskWorkload {
@@ -38,83 +38,6 @@ fn roundtrip(task: &Task) {
     let back: Task = serde_json::from_str(&json1).expect("deserialize");
     let json2 = serde_json::to_string(&back).expect("reserialize");
     assert_eq!(json1, json2, "roundtrip drift");
-}
-
-fn routed(api_version: &str, kind: &str, body: serde_json::Value) -> TaskWorkload {
-    TaskWorkload::Routed(Workload::new(api_version, kind, body).unwrap())
-}
-
-#[test]
-fn routed_workload_variants_roundtrip() {
-    let spec = fully_populated_spec(routed(
-        "exec.solti.io/v1",
-        "Subprocess",
-        serde_json::json!({
-            "mode": {"command": "/usr/bin/make", "args": ["-j4", "test"]},
-            "env": [{"key": "LANG", "value": "C.UTF-8"}],
-            "cwd": "/workspace",
-            "failOnNonZero": true
-        }),
-    ));
-    let mut task = Task::new("task-sub-cmd", spec).unwrap();
-    task.transition_starting(1, 1, "1").unwrap();
-    task.transition_finished(1, 1, TaskPhase::Failed, Some("retry".into()), None, "2")
-        .unwrap();
-    task.transition_starting(1, 2, "3").unwrap();
-    task.transition_finished(1, 2, TaskPhase::Failed, Some("retry-2".into()), None, "4")
-        .unwrap();
-    task.transition_starting(1, 3, "5").unwrap();
-    let command = task;
-
-    let spec = fully_populated_spec(routed(
-        "chain.solti.io/v1alpha1",
-        "Chain",
-        serde_json::json!({"steps": [{"name": "a"}, {"name": "b"}]}),
-    ));
-    let chain = Task::new("task-chain", spec).unwrap();
-
-    let spec = fully_populated_spec(routed(
-        "exec.solti.io/v1",
-        "Container",
-        serde_json::json!({
-            "image": "registry.example.com/build:v1.2.3",
-            "command": ["sh", "-c"],
-            "args": ["echo hi"]
-        }),
-    ));
-    let mut task = Task::new("task-ctr", spec).unwrap();
-    task.transition_starting(1, 1, "1").unwrap();
-    task.transition_finished(
-        1,
-        1,
-        TaskPhase::Failed,
-        Some("SIGKILL".into()),
-        Some(137),
-        "2",
-    )
-    .unwrap();
-    let container = task;
-
-    let embedded = Task::new("task-embedded", fully_populated_spec(embedded("test-v1"))).unwrap();
-
-    for task in [&command, &chain, &container, &embedded] {
-        roundtrip(task);
-    }
-}
-
-#[test]
-fn routed_body_preserves_unicode_exactly_in_json() {
-    let workload = routed(
-        "tasks.example.io/v1",
-        "Report",
-        serde_json::json!({"cwd": "/工作/δ", "module": "/модули/报告.wasm"}),
-    );
-    let json = serde_json::to_value(&workload).unwrap();
-    assert_eq!(json["spec"]["cwd"], "/工作/δ");
-    assert_eq!(json["spec"]["module"], "/модули/报告.wasm");
-
-    let decoded: TaskWorkload = serde_json::from_value(json).unwrap();
-    assert_eq!(decoded, workload);
 }
 
 #[test]

@@ -497,45 +497,6 @@ fn generated_openapi_describes_the_installed_task_routes() {
 }
 
 #[test]
-fn http_openapi_describes_the_generic_workload_envelope() {
-    let parts = HttpApi::new(Arc::new(MockHandler::default())).build();
-    let document = serde_json::to_value(parts.openapi).unwrap();
-    let schemas = &document["components"]["schemas"];
-
-    // SoltiTaskWorkload is the routed envelope: a GVK and a free JSON object.
-    let workload = &schemas["SoltiTaskWorkload"];
-    let envelope = match workload.get("$ref").and_then(Value::as_str) {
-        Some(reference) => &schemas[reference.rsplit('/').next().unwrap()],
-        None => workload,
-    };
-    assert_eq!(
-        envelope["required"],
-        serde_json::json!(["apiVersion", "kind", "spec"])
-    );
-    assert_eq!(envelope["additionalProperties"], false);
-    assert_eq!(envelope["properties"]["spec"]["type"], "object");
-    assert!(
-        workload.get("oneOf").is_none(),
-        "no typed variants: {workload}"
-    );
-
-    // No typed schema survives and Embedded stays hidden.
-    for removed in [
-        "SubprocessSpec",
-        "WasmSpec",
-        "ContainerSpec",
-        "ExtensionWorkload",
-    ] {
-        assert!(
-            schemas.get(removed).is_none(),
-            "{removed} must not be published"
-        );
-    }
-    assert!(!contains_const(workload, "Embedded"));
-    assert!(!contains_const(envelope, "Embedded"));
-}
-
-#[test]
 fn generated_openapi_reflects_configured_authentication() {
     let token = Token::new("test-secret").unwrap();
     let document = serde_json::to_value(

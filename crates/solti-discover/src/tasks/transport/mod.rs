@@ -38,9 +38,7 @@ use http::HttpAdapter;
 
 /// Selected transport for one discovery task.
 pub(super) enum TransportAdapter {
-    #[cfg(feature = "grpc")]
     Grpc(Box<GrpcAdapter>),
-    #[cfg(feature = "http")]
     Http(HttpAdapter),
 }
 
@@ -48,9 +46,7 @@ impl TransportAdapter {
     /// Creates only the adapter selected by the config.
     pub(super) fn from_config(config: &DiscoverConfig) -> Result<Self, DiscoverError> {
         match config.control_plane.transport {
-            #[cfg(feature = "grpc")]
             DiscoveryTransport::Grpc => GrpcAdapter::new(config).map(Box::new).map(Self::Grpc),
-            #[cfg(feature = "http")]
             DiscoveryTransport::Http => HttpAdapter::new(config).map(Self::Http),
         }
     }
@@ -60,9 +56,7 @@ impl TransportAdapter {
     /// Returns the accepted response, `want_schemas` included.
     pub(super) async fn sync(&self, request: SyncRequest) -> Result<SyncResponse, DiscoverError> {
         match self {
-            #[cfg(feature = "grpc")]
             Self::Grpc(adapter) => adapter.sync(request).await,
-            #[cfg(feature = "http")]
             Self::Http(adapter) => adapter.sync(request).await,
         }
     }
@@ -72,9 +66,7 @@ impl TransportAdapter {
     /// This is the size the control plane's request limit counts.
     pub(super) fn encoded_len(&self, request: &SyncRequest) -> usize {
         match self {
-            #[cfg(feature = "grpc")]
             Self::Grpc(adapter) => adapter.encoded_len(request),
-            #[cfg(feature = "http")]
             Self::Http(adapter) => adapter.encoded_len(request),
         }
     }
@@ -82,9 +74,7 @@ impl TransportAdapter {
     /// Returns whether the selected endpoint uses TLS.
     pub(super) fn is_secure(&self) -> bool {
         match self {
-            #[cfg(feature = "grpc")]
             Self::Grpc(adapter) => adapter.is_secure(),
-            #[cfg(feature = "http")]
             Self::Http(adapter) => adapter.is_secure(),
         }
     }
@@ -131,15 +121,11 @@ fn validate_response(response: SyncResponse) -> Result<SyncResponse, DiscoverErr
 #[cfg(test)]
 pub(in crate::tasks) mod fake {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+
+    use std::sync::Mutex;
 
     use sha2::{Digest as _, Sha256};
-    use tokio::sync::oneshot;
-    use tokio::task::JoinHandle;
 
-    use crate::config::DiscoveryTransport;
     use crate::proto::SyncRequest;
 
     /// Podium's cap on one discovery request: the HTTP body or the gRPC message.
@@ -156,17 +142,6 @@ pub(in crate::tasks) mod fake {
         Unavailable,
     }
 
-    /// One request the fake received.
-    #[derive(Clone, Debug)]
-    pub(in crate::tasks) struct Seen {
-        /// Its encoded size: the HTTP body or the gRPC message.
-        pub(in crate::tasks) bytes: usize,
-        /// The fingerprints of the schemas it carried, in order.
-        pub(in crate::tasks) schemas: Vec<String>,
-        /// The answer.
-        pub(in crate::tasks) outcome: Outcome,
-    }
-
     /// The schema exchange of Podium's discovery: it stores each offered schema
     /// that the same request declares and whose recomputed fingerprint matches,
     /// and wants every declared fingerprint it does not hold, sorted.
@@ -178,7 +153,7 @@ pub(in crate::tasks) mod fake {
     #[derive(Default)]
     struct State {
         catalog: BTreeMap<String, Vec<u8>>,
-        seen: Vec<Seen>,
+        requests: usize,
         unavailable: BTreeSet<usize>,
         never_stored: BTreeSet<String>,
         /// A cap below Podium's, as a proxy in front of it may set.
@@ -186,67 +161,18 @@ pub(in crate::tasks) mod fake {
     }
 
     impl FakeControlPlane {
-        /// A control plane behind a proxy that refuses requests over
-        /// `max_bytes`, with the answers Podium gives over its own cap.
-        pub(in crate::tasks) fn limited(max_bytes: usize) -> Self {
-            let control = Self::default();
-            control.lock().max_bytes = Some(max_bytes);
-            control
-        }
-
-        /// A control plane that fails the requests numbered in `requests`,
-        /// counting from 1.
-        pub(in crate::tasks) fn failing(requests: impl IntoIterator<Item = usize>) -> Self {
-            let control = Self::default();
-            control.lock().unavailable.extend(requests);
-            control
-        }
-
-        /// A control plane that never manages to store `fingerprint`, as after a
-        /// store error.
-        pub(in crate::tasks) fn losing(fingerprint: &str) -> Self {
-            let control = Self::default();
-            control.lock().never_stored.insert(fingerprint.to_owned());
-            control
-        }
-
         /// Answers one request of `bytes` encoded bytes.
         pub(in crate::tasks) fn answer(&self, request: &SyncRequest, bytes: usize) -> Outcome {
             let mut state = self.lock();
-            let number = state.seen.len() + 1;
-            let outcome = if bytes > state.max_bytes.unwrap_or(PODIUM_MAX_SYNC_BYTES) {
+            state.requests += 1;
+            let number = state.requests;
+            if bytes > state.max_bytes.unwrap_or(PODIUM_MAX_SYNC_BYTES) {
                 Outcome::TooLarge
             } else if state.unavailable.contains(&number) {
                 Outcome::Unavailable
             } else {
                 Outcome::Accepted(state.exchange(request))
-            };
-            state.seen.push(Seen {
-                bytes,
-                schemas: request
-                    .schemas
-                    .iter()
-                    .map(|schema| schema.fingerprint.clone())
-                    .collect(),
-                outcome: outcome.clone(),
-            });
-            outcome
-        }
-
-        /// Every request received so far, in order.
-        pub(in crate::tasks) fn seen(&self) -> Vec<Seen> {
-            self.lock().seen.clone()
-        }
-
-        /// The stored schemas, by fingerprint.
-        pub(in crate::tasks) fn catalog(&self) -> BTreeMap<String, Vec<u8>> {
-            self.lock().catalog.clone()
-        }
-
-        /// Loses every stored schema, as Podium's memory backend does when it
-        /// restarts.
-        pub(in crate::tasks) fn restart(&self) {
-            self.lock().catalog.clear();
+            }
         }
 
         fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -292,54 +218,6 @@ pub(in crate::tasks) mod fake {
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
         )
-    }
-
-    /// A fake serving one transport on a loopback port.
-    pub(in crate::tasks) struct FakeServer {
-        address: SocketAddr,
-        shutdown: oneshot::Sender<()>,
-        task: JoinHandle<()>,
-    }
-
-    impl FakeServer {
-        pub(in crate::tasks) fn new(
-            address: SocketAddr,
-            shutdown: oneshot::Sender<()>,
-            task: JoinHandle<()>,
-        ) -> Self {
-            Self {
-                address,
-                shutdown,
-                task,
-            }
-        }
-
-        /// The control-plane endpoint of the fake.
-        pub(in crate::tasks) fn endpoint(&self) -> String {
-            format!("http://{}", self.address)
-        }
-
-        /// Stops the fake and waits until it has.
-        pub(in crate::tasks) async fn stop(self) {
-            let _ = self.shutdown.send(());
-            tokio::time::timeout(Duration::from_secs(5), self.task)
-                .await
-                .expect("the fake control plane stops within the bound")
-                .expect("the fake control plane does not panic");
-        }
-    }
-
-    /// Serves `control` over `transport` on an ephemeral loopback port.
-    pub(in crate::tasks) async fn serve(
-        transport: DiscoveryTransport,
-        control: Arc<FakeControlPlane>,
-    ) -> FakeServer {
-        match transport {
-            #[cfg(feature = "grpc")]
-            DiscoveryTransport::Grpc => super::grpc::fake::serve(control).await,
-            #[cfg(feature = "http")]
-            DiscoveryTransport::Http => super::http::fake::serve(control).await,
-        }
     }
 }
 
