@@ -600,6 +600,17 @@ impl Reconciler {
         self.arm_intake_panic(name, InjectedIntakePanicStage::AfterProvisionalBind)
     }
 
+    /// Whether the active reconciliation of `name` carries a `cancel_task` request.
+    #[cfg(test)]
+    pub(crate) fn has_user_cancellation(&self, name: &TaskId) -> bool {
+        let slots = self.reconciliation_queue.slots.lock();
+        slots.get(name).is_some_and(|slot| {
+            slot.active_cancellation
+                .as_ref()
+                .is_some_and(ReconciliationCancellation::is_user_requested)
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn arm_before_accepted_waiter_handoff_panic(
         &self,

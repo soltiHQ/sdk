@@ -2313,9 +2313,15 @@ async fn post_bind_panic_releases_the_exact_unsubmitted_binding_before_settlemen
     let cancel_api = Arc::clone(&api);
     let cancel_name = name.clone();
     let cancellation = tokio::spawn(async move { cancel_api.cancel_task(&cancel_name).await });
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
+    // Release the panic only after cancel_task has reached the paused
+    // reconciliation: a fixed number of yields lost that race under load.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !api.reconciler.has_user_cancellation(&name) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancel_task did not reach the paused reconciliation");
     assert!(
         !cancellation.is_finished(),
         "cancel_task must wait for coordinator-owned unwind recovery"
